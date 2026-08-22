@@ -1,5 +1,5 @@
-// "instant"/"medium"/"high" are the ChatGPT Plus effort labels; the older
-// light/standard/extended/heavy/pro set remains for other account tiers.
+// "instant"/"medium"/"high" are the current composer's effort labels; older
+// tier names stay valid input aliases but cannot be selected on this layout.
 const CHATGPT_EFFORT_CHOICES = [
   "light",
   "standard",

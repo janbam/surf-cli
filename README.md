@@ -526,10 +526,10 @@ surf aistudio.build "game" --keep-open --timeout 600          # Keep tab open, 1
 
 #### Oracle
 
-Use `surf oracle` for a durable, local ChatGPT consult instead of a quick `surf chatgpt` one-shot. It persists jobs by conversation URL, supports repeatable file-context globs, and verifies requested model and reasoning effort before submission. ChatGPT model aliases include `instant`, `thinking`, `pro`, `gpt-5.5`, and `gpt-5.6-sol`. Use `--model gpt-5.6-sol --effort pro` for GPT-5.6 Sol with Pro effort.
+Use `surf oracle` for a durable, local ChatGPT consult instead of a quick `surf chatgpt` one-shot. It persists jobs by conversation URL, supports repeatable file-context globs, and verifies requested model and reasoning effort before submission. ChatGPT model aliases include `instant`, `thinking`, `pro`, `gpt-5.5`, and `gpt-5.6-sol`. Use `--model gpt-5.6-sol --effort high` for GPT-5.6 Sol with High effort; selectable efforts are the composer's current Instant/Medium/High labels, and other values fail closed.
 
 ```bash
-surf oracle ask "review this change" --files "src/**/*.ts" --model gpt-5.5 --effort pro --detach --json
+surf oracle ask "review this change" --files "src/**/*.ts" --model gpt-5.6-sol --effort high --detach --json
 surf oracle status <job-id> --json
 surf oracle result <job-id> --wait --json
 surf oracle follow <job-id> "challenge that recommendation" --detach --json
@@ -996,7 +996,7 @@ pi -e /path/to/surf-cli/pi-extension/surf.ts
 
 It registers `surf_read`, `surf_screenshot`, `surf_click`, `surf_type`, `surf_tool`, and the `surf_oracle_*` tools. Browser calls use Surf's native-host socket, not shell commands. If `pi-subagents/background-work` is installed, the extension also reports active oracle jobs started by that Pi session. Pi still loads the browser tools when pi-subagents is not installed.
 
-The extension also registers a `surf-oracle` external-job provider when a Pi runtime exposes that provider bridge. The provider implements pi-subagents' external-job contract: `start`, `status`, `result`, and `reattach` operations that return `providerJobId`, a contract state (`queued`, `running`, `completed`, `failed`), the durable conversation URL, the captured result text as `output`, and failure code and message when present. It reads `options.model` and `options.effort` for starts, so a Pi profile can request `model: gpt-5.6-sol` plus `effort: pro` and reach ChatGPT GPT-5.6 Sol with Pro effort through Surf. Capacity stays fail-closed: Surf returns the blocking job id instead of silently queueing a second ChatGPT job.
+The extension also registers a `surf-oracle` external-job provider when a Pi runtime exposes that provider bridge. The provider implements pi-subagents' external-job contract: `start`, `status`, `result`, and `reattach` operations that return `providerJobId`, a contract state (`queued`, `running`, `completed`, `failed`), the durable conversation URL, the captured result text as `output`, and failure code and message when present. It reads `options.model` and `options.effort` for starts, so a Pi profile can request `model: gpt-5.6-sol` plus `effort: high` and reach ChatGPT GPT-5.6 Sol with High effort through Surf. Capacity stays fail-closed: Surf returns the blocking job id instead of silently queueing a second ChatGPT job.
 
 When Surf is installed as a Pi package, it also exposes an optional `gpt` package agent for `pi-subagents`. That profile uses `runner.type: external-job`, provider `surf-oracle`, `options.model: gpt-5.6-sol`, and `options.effort: high` for ChatGPT Plus accounts. Surf remains useful without Pi or `pi-subagents`; the package agent only wires Surf's browser-backed ChatGPT access into Pi's agent picker.
 

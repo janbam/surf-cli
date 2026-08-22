@@ -22,17 +22,6 @@ const SELECTORS = {
     'button[data-testid="send-button"], button[data-testid*="composer-send"], form button[type="submit"]',
   modelButton:
     '[data-testid="model-switcher-dropdown-button"], [data-testid="composer-footer-actions"] button[aria-haspopup="menu"], button.__composer-pill[aria-haspopup="menu"], .__composer-pill-composite button[aria-haspopup="menu"]',
-  modelMenu: '[role="menu"][data-radix-menu-content]',
-  modelMenuItem: 'button, [role="menuitem"], [role="menuitemradio"]',
-  menuItemPrimaryLabel: '.min-w-0 > span',
-  effortButton:
-    '[data-testid="composer-footer-actions"] button[aria-haspopup="menu"], button.__composer-pill[aria-haspopup="menu"], .__composer-pill-composite button[aria-haspopup="menu"]',
-  effortMenu: '[role="menu"], [data-radix-collection-root], [role="group"]',
-  effortMenuItem: 'button, [role="menuitem"], [role="menuitemradio"]',
-  effortMenuLabel: '.__menu-label, [class*="menu-label"]',
-  effortSubmenuTrigger: '[role="menuitem"][aria-haspopup="menu"], button[aria-haspopup="menu"]',
-  selectedMenuIndicator:
-    '[aria-checked="true"], [aria-selected="true"], [data-selected="true"], [data-state="checked"], [data-state="selected"], [data-state="on"]',
   assistantMessage:
     '[data-message-author-role="assistant"], [data-turn="assistant"], [data-testid*="assistant-message"], [data-testid*="assistant-turn"], [data-testid*="assistant-response"]',
   assistantContent:
@@ -291,15 +280,19 @@ async function waitFor(predicate, timeoutMs, signal) {
 // Ensure the given radio is selected: open the submenu, click the target if it
 // is unchecked, then reopen and require it checked before dismissing the menu.
 // Clicking the already-checked entry is harmless and closes the menu.
+// One overall deadline bounds every stage and retry attempt so a menu that
+// never opens fails within ~timeoutMs instead of paying timeoutMs per stage.
 async function ensureSelection(cdp, kind, requested, matchesTarget, timeoutMs, signal) {
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const deadline = Date.now() + timeoutMs;
+  const remaining = () => Math.max(1, deadline - Date.now());
+  for (let attempt = 0; attempt < 2 && Date.now() < deadline; attempt++) {
     if (!(await openComposerMenu(cdp))) throw verificationError(kind, requested);
-    const row = await waitFor(() => findSubmenuRow(cdp, kind), timeoutMs, signal);
+    const row = await waitFor(() => findSubmenuRow(cdp, kind), remaining(), signal);
     if (!row || !(await clickSubmenuRow(cdp, kind))) throw verificationError(kind, requested, [{ label: row || "" }]);
     const radios = await waitFor(async () => {
       const list = await readVisibleRadios(cdp);
       return list.length > 0 ? list : null;
-    }, timeoutMs, signal);
+    }, remaining(), signal);
     if (!radios) throw verificationError(kind, requested);
     const candidates = radios.filter(matchesTarget);
     if (candidates.length !== 1) throw verificationError(kind, requested, radios);
