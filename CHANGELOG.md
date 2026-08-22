@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- **ChatGPT Plus support for oracle model/effort selection** - Rewrote `selectModel`/`selectEffort` for the current composer layout: one pill labeled with the active effort (Instant/Medium/High) opening Model/Effort submenu radios. Added `instant`, `medium`, and `high` to the accepted effort vocabulary. The renamed `gpt` package agent now pins GPT-5.6 Sol with High effort for Plus accounts (replacing the Pro-tier `gpt-pro`).
+
 ## [2.15.2] - 2026-08-22
 
 ### Highlights
