@@ -21,18 +21,19 @@ const backgroundWorkKey = Symbol.for("pi-subagents.background-work.v1");
 const externalJobProviderKey = Symbol.for("pi-subagents.external-job-providers.v1");
 
 describe("Pi extension", () => {
-  it("exposes the optional GPT Pro package agent", () => {
+  it("exposes the optional GPT package agent pinned to Sol with high effort", () => {
     const root = process.cwd();
     const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
-    const agent = fs.readFileSync(path.join(root, "agents", "gpt-pro.md"), "utf8");
+    const agent = fs.readFileSync(path.join(root, "agents", "gpt.md"), "utf8");
 
     expect(packageJson.files).toContain("agents/");
     expect(packageJson.pi.subagents.agents).toEqual(["./agents"]);
-    expect(agent).toContain("name: gpt-pro");
+    expect(agent).toContain("name: gpt");
     expect(agent).toContain("type: external-job");
     expect(agent).toContain("provider: surf-oracle");
     expect(agent).toContain("model: gpt-5.6-sol");
-    expect(agent).toContain("effort: pro");
+    // Plus accounts expose Instant/Medium/High; Pro effort is not available.
+    expect(agent).toContain("effort: high");
   });
 
   it("maps browser tools to the native host request frame", () => {

@@ -1,4 +1,35 @@
-const CHATGPT_EFFORT_CHOICES = ["light", "standard", "extended", "heavy", "pro"];
+// "instant"/"medium"/"high" are the current composer's effort labels; older
+// tier names stay valid input aliases but cannot be selected on this layout.
+const CHATGPT_EFFORT_CHOICES = [
+  "light",
+  "standard",
+  "extended",
+  "heavy",
+  "pro",
+  "instant",
+  "medium",
+  "high",
+];
+
+// The Plus composer exposes one pill whose text is exactly the current effort.
+function isPlusComposerEffortPillLabel(value) {
+  const normalized = String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+  return ["instant", "medium", "high"].includes(normalized);
+}
+
+// Advanced submenu rows concatenate label and value ("ModelGPT-5.6 Sol"), so
+// prefix matching must not rely on word boundaries.
+function plusMenuRowKind(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (/^model/i.test(text)) return "model";
+  if (/^effort/i.test(text)) return "effort";
+  return null;
+}
+
+function plusMenuRowCurrentValue(value, kind) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return kind === "model" ? text.replace(/^model/i, "").trim() : text.replace(/^effort/i, "").trim();
+}
 const CHATGPT_MODEL_ALIASES = new Map([
   ["instant", "instant"],
   ["gpt53", "instant"],
@@ -120,8 +151,13 @@ function boundedOptionLabels(items) {
 module.exports = {
   CHATGPT_EFFORT_CHOICES,
   boundedOptionLabels,
+  effortCandidateMatches,
+  isPlusComposerEffortPillLabel,
+  modelCandidateMatches,
   normalizeChatGPTEffortChoice,
   normalizeChatGPTModelChoice,
+  plusMenuRowCurrentValue,
+  plusMenuRowKind,
   resolveChatGPTEffortMenuOption,
   resolveChatGPTModelMenuOption,
   verifyChatGPTEffortSelection,

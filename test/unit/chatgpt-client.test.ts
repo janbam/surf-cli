@@ -1,6 +1,8 @@
 import { vi } from "vitest";
 // @ts-expect-error - CommonJS module without type definitions
 import * as chatgptClient from "../../native/chatgpt-client.cjs";
+// @ts-expect-error - CommonJS module without type definitions
+import * as selection from "../../native/chatgpt-client-selection.cjs";
 
 function createReadyChatGptEvaluate(
   loginStatus: Record<string, unknown> = { status: 200, hasLoginCta: false },
@@ -307,6 +309,11 @@ describe("chatgpt-client", () => {
       { role: "menuitemradio", label: "Extended", testId: "thinking-time-extended" },
       { role: "menuitemradio", label: "Heavy", testId: "thinking-time-heavy" },
     ];
+    const plusEffortOptions = [
+      { role: "menuitemradio", label: "Instant", checked: false },
+      { role: "menuitemradio", label: "Medium", checked: false },
+      { role: "menuitemradio", label: "High", checked: true },
+    ];
 
     it.each([
       ["requested model found", modelState, "thinking", "ChatGPT 5.4 Thinking"],
@@ -390,7 +397,45 @@ describe("chatgpt-client", () => {
       );
       expect(chatgptClient.normalizeChatGPTEffortChoice("STANDARD")).toBe("standard");
       expect(chatgptClient.normalizeChatGPTEffortChoice("Pro")).toBe("pro");
-      expect(chatgptClient.normalizeChatGPTEffortChoice("maximum")).toBeNull();
+      // ChatGPT Plus exposes Instant/Medium/High instead of the legacy tiers.
+      expect(chatgptClient.normalizeChatGPTEffortChoice("High")).toBe("high");
+      expect(chatgptClient.normalizeChatGPTEffortChoice("MEDIUM")).toBe("medium");
+      expect(chatgptClient.normalizeChatGPTEffortChoice("instant")).toBe("instant");
+      expect(chatgptClient.resolveChatGPTEffortMenuOption(plusEffortOptions, "high")).toEqual(
+        plusEffortOptions[2],
+      );
+      expect(
+        chatgptClient.resolveChatGPTEffortMenuOption(plusEffortOptions, "extended"),
+      ).toBeNull();
+    });
+
+    describe("plus composer helpers", () => {
+      it("recognizes the effort pill by its exact label", () => {
+        expect(selection.isPlusComposerEffortPillLabel("High")).toBe(true);
+        expect(selection.isPlusComposerEffortPillLabel("  instant ")).toBe(true);
+        expect(selection.isPlusComposerEffortPillLabel("Pro")).toBe(false);
+        expect(selection.isPlusComposerEffortPillLabel("Higher")).toBe(false);
+        expect(selection.isPlusComposerEffortPillLabel("")).toBe(false);
+      });
+
+      it.each([
+        ["ModelGPT-5.6 Sol", "model", "GPT-5.6 Sol"],
+        ["EffortHigh", "effort", "High"],
+        ["Advanced", null, ""],
+      ])("classifies row %j", (label, kind, value) => {
+        expect(selection.plusMenuRowKind(label)).toBe(kind);
+        expect(kind ? selection.plusMenuRowCurrentValue(label, kind) : "").toBe(value);
+      });
+
+      it("matches Plus model radios through the shared model matcher", () => {
+        const radios = [
+          { role: "menuitemradio", label: "GPT-5.6 Sol", checked: true },
+          { role: "menuitemradio", label: "GPT-5.5", checked: false },
+        ];
+        const matches = radios.filter((item) => selection.modelCandidateMatches(item, "gpt56sol"));
+        expect(matches).toHaveLength(1);
+        expect(matches[0].label).toBe("GPT-5.6 Sol");
+      });
     });
   });
 
