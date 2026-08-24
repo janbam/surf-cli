@@ -23,8 +23,32 @@ const MAX_REOPENS = 3;
 const FAILURE_RETRY_MS = 2000;
 // Errors that describe the job itself rather than the connection to the
 // browser. Everything else is assumed transient until patience runs out.
-const FATAL_CODES = new Set(["harvest_failed", "auth", "cloudflare", "unattributable"]);
+// Registry codes belong here too: a record that refuses a transition is a
+// verdict about the job, and retrying it just burns tabs for five minutes.
+const FATAL_CODES = new Set([
+  "auth",
+  "cloudflare",
+  "harvest_failed",
+  "invalid_transition",
+  "not_found",
+  "unattributable",
+]);
 const TERMINAL_STATES = new Set(["captured", "failed"]);
+
+/**
+ * True when the job record can no longer receive this watcher's outcome:
+ * already terminal, or gone entirely.
+ *
+ * A watcher that keeps working past this point cannot record anything, but can
+ * still create a browser tab on every retry.
+ */
+function jobIsSettled(jobId) {
+  try {
+    return TERMINAL_STATES.has(oracleJobs.getJob(jobId).state);
+  } catch (error) {
+    return error?.code === "not_found";
+  }
+}
 
 function codedError(code, message, details = {}) {
   const error = new Error(message);
@@ -182,8 +206,11 @@ function createHarvestSupervisor({
             options.cdpEvaluate(tabId, expression),
           ),
         );
-        // One clean round trip retires the whole failure theory.
+        // One clean round trip retires the whole failure theory, reopen budget
+        // included: a tab that dies an hour from now deserves the same recovery
+        // as one that died in the first minute.
         unreachableSince = null;
+        reopens = 0;
 
         if (Date.now() >= nextHeartbeatAt) {
           oracleJobs.touchHarvest(jobId);
@@ -198,6 +225,11 @@ function createHarvestSupervisor({
         }
       } catch (error) {
         if (error?.code === "SURF_REQUEST_ABORTED" || FATAL_CODES.has(error?.code)) throw error;
+        // The job may have ended underneath this watcher — cancelled, or reaped
+        // by another process. Then there is nothing left to harvest and nothing
+        // to report; retrying would create a tab per cycle for the whole
+        // patience window.
+        if (jobIsSettled(jobId)) return;
         unreachableSince = unreachableSince ?? Date.now();
         // Patience is measured in wall time, not attempts: a 30s extension
         // timeout and an instant socket error must buy the same grace.
@@ -211,6 +243,9 @@ function createHarvestSupervisor({
         if (job.conversationUrl && reopens < MAX_REOPENS) {
           log(`[oracle:${jobId}:harvest] Reopening conversation in a fresh tab`);
           reopens++;
+          // Give up the old tab explicitly. Nothing else will: this one was
+          // usable when it was created, so the acquisition cleanup never sees it.
+          if (tabId !== null) await closeTab(request, tabId).catch(() => {});
           tabId = null;
           job = { ...job, tabId: null };
         }

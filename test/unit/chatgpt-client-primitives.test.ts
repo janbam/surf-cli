@@ -37,18 +37,25 @@ describe("chatgpt-client primitives", () => {
       result: { value: { candidates, stopVisible: false } },
     });
 
-    it("waits for turns to render before letting the caller snapshot", async () => {
+    // User turns paint first. A transcript showing only those still normalizes
+    // to an empty baseline, so it must not satisfy the gate.
+    it("waits for the assistant turn, not merely for any rendered turn", async () => {
       const renders = [
         snapshotWith([]),
-        snapshotWith([]),
-        snapshotWith([{ role: "assistant", isAssistant: true, text: "parent", messageId: "m1" }]),
+        snapshotWith([{ role: "user", isUser: true, text: "parent question" }]),
+        snapshotWith([
+          { role: "user", isUser: true, text: "parent question" },
+          { role: "assistant", isAssistant: true, text: "parent", messageId: "m1" },
+        ]),
       ];
       let call = 0;
       const cdp = async () => renders[Math.min(call++, renders.length - 1)];
 
       const snapshot = await chatgptClient.waitForConversationTurns(cdp, 5000);
 
-      expect(snapshot.candidates).toHaveLength(1);
+      expect(chatgptClient.normalizeResponseSnapshot(snapshot).latestAssistant).toMatchObject({
+        messageId: "m1",
+      });
       expect(call).toBeGreaterThan(2);
     });
 

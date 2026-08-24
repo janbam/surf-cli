@@ -289,6 +289,26 @@ describe("oracle harvest supervisor", () => {
     expect(oracleJobs.getJob(job.id)).toMatchObject({ state: "captured" });
   });
 
+  // A record can end underneath a live watcher: a concurrent cancel, or the
+  // staleness reaper in another host process. Every browser step then fails
+  // with `invalid_transition`, and treating that as "the browser is flaky"
+  // opens a fresh ChatGPT tab on every retry until patience runs out.
+  it("stops instead of retrying once the job record has ended", async () => {
+    useTempState();
+    const job = dispatchedJob({ tabId: null, conversationUrl: CONVERSATION_URL });
+    oracleJobs.markFailed(job.id, { code: "cancelled", message: "cancelled by the user" });
+    const browser = createBrowser({ tabs: [] });
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    await supervisor.watch(job.id);
+
+    expect(browser.created.length).toBeLessThanOrEqual(1);
+    expect(oracleJobs.getJob(job.id)).toMatchObject({
+      state: "failed",
+      error: { code: "cancelled" },
+    });
+  });
+
   it("fails with the web-history limitation when neither tab nor URL survive", async () => {
     useTempState();
     const job = dispatchedJob({ tabId: 7 });

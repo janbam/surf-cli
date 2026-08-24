@@ -93,12 +93,15 @@ async function assertUsablePage(cdp, signal) {
     throw codedError("Cloudflare challenge detected - complete in browser", "cloudflare");
   }
   const loginStatus = await checkLoginStatus(cdp);
+  // Status 0 means the probe itself never completed — navigation still
+  // settling, a service worker restarting, a blip. That says nothing about the
+  // session, so it stays uncoded and callers may retry it. Coding it `auth`
+  // would make a transient hiccup permanently fatal for a harvest.
   if (loginStatus.status === 0) {
-    throw codedError(
+    throw new Error(
       loginStatus.error
-        ? `ChatGPT login check failed: ${loginStatus.error}`
-        : "ChatGPT login check failed",
-      "auth",
+        ? `ChatGPT login check did not complete: ${loginStatus.error}`
+        : "ChatGPT login check did not complete",
     );
   }
   if (loginStatus.status !== 200 || loginStatus.hasLoginCta) {
@@ -123,7 +126,9 @@ async function waitForConversationTurns(cdp, timeoutMs = 15000, signal) {
   while (Date.now() < deadline) {
     throwIfAborted(signal);
     const snapshot = await readChatGPTResponseSnapshot(cdp);
-    if (snapshot?.candidates?.length > 0) return snapshot;
+    // User turns paint first, and a transcript showing only those still yields
+    // an empty baseline. The assistant turn is the one identity depends on.
+    if (normalizeResponseSnapshot(snapshot).latestAssistant) return snapshot;
     await delay(250, signal);
   }
   throw codedError(
@@ -192,7 +197,9 @@ async function dispatch(options) {
     log("Prompt ready");
     // Reopening an existing conversation: its turns must be on screen before
     // anything snapshots them, or this dispatch has no identity to work from.
-    if (startUrl && extractConversationUrl(startUrl)) {
+    // Gating here fails before any prompt is typed into the composer.
+    const resumingConversation = Boolean(startUrl && extractConversationUrl(startUrl));
+    if (resumingConversation) {
       await waitForConversationTurns(cdp, 15000, signal);
       log("Conversation turns rendered");
     }
@@ -231,6 +238,16 @@ async function dispatch(options) {
     // identifies our answer by turn identity, so it must be recorded durably
     // by the caller before the response can arrive.
     const baseline = normalizeResponseSnapshot(await readChatGPTResponseSnapshot(cdp));
+    // The gate above ran before model selection and typing; this is the
+    // snapshot that actually becomes the baseline, so it is the one that has to
+    // hold. Sending into a conversation we cannot identify turns in would make
+    // the parent's answer a plausible capture for this job.
+    if (resumingConversation && !baseline.latestAssistant) {
+      throw codedError(
+        "Conversation baseline is empty; refusing to send a follow-up that could not be identified",
+        "baseline_unavailable",
+      );
+    }
     if (beforeSubmit) await raceAbort(beforeSubmit, signal);
     await clickSend(cdp, inputCdp, signal);
     const promptEcho = normalizePromptEcho(prompt);
@@ -386,6 +403,7 @@ module.exports = {
   isChatGPTResponseComplete,
   isCloudflareBlocked,
   normalizePromptEcho,
+  normalizeResponseSnapshot,
   extractConversationUrl,
   verifyChatGPTEffortSelection,
   verifyChatGPTModelSelection,

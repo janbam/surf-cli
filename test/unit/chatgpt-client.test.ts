@@ -666,7 +666,10 @@ describe("chatgpt-client", () => {
       );
     });
 
-    it("preserves login check failures instead of downgrading them to login required", async () => {
+    // A login probe that never completed says nothing about the session, so it
+    // must keep its own message and stay uncoded: harvest watchers retry
+    // uncoded failures and treat `auth` as final.
+    it("reports an incomplete login check as transient, not as a login wall", async () => {
       const closeCalls: number[] = [];
 
       await expect(
@@ -688,9 +691,30 @@ describe("chatgpt-client", () => {
             url: "https://chatgpt.com/",
           }),
         }),
-      ).rejects.toThrow("ChatGPT login check failed: TypeError: Failed to fetch");
+      ).rejects.toThrow("ChatGPT login check did not complete: TypeError: Failed to fetch");
 
-      expect(closeCalls).toEqual([123]);
+      await expect(
+        chatgptClient.query({
+          prompt: "hello",
+          getCookies: async () => ({
+            cookies: [{ name: "__Secure-next-auth.session-token.0", value: "abc" }],
+          }),
+          createTab: async () => ({ tabId: 124 }),
+          closeTab: async (tabId: number) => {
+            closeCalls.push(tabId);
+          },
+          cdpCommand: async () => {
+            throw new Error("cdpCommand should not be called");
+          },
+          cdpEvaluate: createReadyChatGptEvaluate({
+            status: 0,
+            error: "TypeError: Failed to fetch",
+            url: "https://chatgpt.com/",
+          }),
+        }),
+      ).rejects.not.toMatchObject({ code: "auth" });
+
+      expect(closeCalls).toEqual([123, 124]);
     });
   });
 
