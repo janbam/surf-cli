@@ -20,10 +20,10 @@ const {
 } = require("./chatgpt-client-ui.cjs");
 const {
   cleanChatGPTResponseText,
+  createResponseTracker,
   extractLatestAssistantSnapshot,
   isChatGPTResponseComplete,
   isNewAssistantContent,
-  matchesPromptEcho,
   normalizePromptEcho,
   normalizeResponseSnapshot,
   readChatGPTResponseSnapshot,
@@ -31,7 +31,11 @@ const {
 } = require("./chatgpt-client-response.cjs");
 
 const CHATGPT_URL = "https://chatgpt.com/";
-const RESPONSE_STARTED_AT = Symbol("responseStartedAt");
+
+// ChatGPT routes optimistically to a client-side placeholder id ("WEB:<uuid>")
+// and only later swaps in the server id. Only the server id survives a reload,
+// so anything else must be treated as "not durable yet" instead of recorded.
+const DURABLE_CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function hasRequiredCookies(cookies) {
   if (!cookies || !Array.isArray(cookies)) return false;
@@ -44,11 +48,18 @@ function hasRequiredCookies(cookies) {
   );
 }
 
+/**
+ * Extract a durable ChatGPT conversation URL from a browser location.
+ *
+ * Returns null for anything that cannot be navigated back to later, including
+ * the transient placeholder ids ChatGPT shows before the server id arrives.
+ */
 function extractConversationUrl(value) {
   try {
     const url = new URL(String(value));
     const match = url.pathname.match(/^\/c\/([^/]+)\/?$/);
     if (url.protocol !== "https:" || url.hostname !== "chatgpt.com" || !match) return null;
+    if (!DURABLE_CONVERSATION_ID.test(match[1])) return null;
     return `${url.origin}/c/${match[1]}`;
   } catch {
     return null;
@@ -70,6 +81,29 @@ function classifyError(error, fallbackCode, preservedCodes = []) {
     classified.code = fallbackCode;
   }
   return classified;
+}
+
+/**
+ * Fail fast on the two page states that make every later step meaningless:
+ * a Cloudflare interstitial and a logged-out session.
+ */
+async function assertUsablePage(cdp, signal) {
+  await waitForPageLoad(cdp, 45000, signal);
+  if (await isCloudflareBlocked(cdp)) {
+    throw codedError("Cloudflare challenge detected - complete in browser", "cloudflare");
+  }
+  const loginStatus = await checkLoginStatus(cdp);
+  if (loginStatus.status === 0) {
+    throw codedError(
+      loginStatus.error
+        ? `ChatGPT login check failed: ${loginStatus.error}`
+        : "ChatGPT login check failed",
+      "auth",
+    );
+  }
+  if (loginStatus.status !== 200 || loginStatus.hasLoginCta) {
+    throw codedError("ChatGPT login required", "auth");
+  }
 }
 
 async function waitForConversationUrl(cdp, timeoutMs = 30000, signal) {
@@ -123,24 +157,8 @@ async function dispatch(options) {
       raceAbort(() => cdpCommand(tabId, method, params), signal);
 
     if (startUrl) await inputCdp("Page.navigate", { url: startUrl });
-    await waitForPageLoad(cdp, 45000, signal);
-    log("Page loaded");
-    if (await isCloudflareBlocked(cdp)) {
-      throw codedError("Cloudflare challenge detected - complete in browser", "cloudflare");
-    }
-    const loginStatus = await checkLoginStatus(cdp);
-    if (loginStatus.status === 0) {
-      throw codedError(
-        loginStatus.error
-          ? `ChatGPT login check failed: ${loginStatus.error}`
-          : "ChatGPT login check failed",
-        "auth",
-      );
-    }
-    if (loginStatus.status !== 200 || loginStatus.hasLoginCta) {
-      throw codedError("ChatGPT login required", "auth");
-    }
-    log("Login verified");
+    await assertUsablePage(cdp, signal);
+    log("Page loaded, login verified");
     const promptReady = await waitForPromptReady(cdp, 30000, signal);
     if (!promptReady) {
       throw new Error("Prompt textarea not ready");
@@ -177,13 +195,15 @@ async function dispatch(options) {
       effortVerified = await selectEffort(cdp, effort, 8000, signal);
       log(`Verified effort: ${effortVerified}`);
     }
+    // Snapshot the conversation before sending: this baseline is what later
+    // identifies our answer by turn identity, so it must be recorded durably
+    // by the caller before the response can arrive.
     const baseline = normalizeResponseSnapshot(await readChatGPTResponseSnapshot(cdp));
     if (beforeSubmit) await raceAbort(beforeSubmit, signal);
     await clickSend(cdp, inputCdp, signal);
-    baseline[RESPONSE_STARTED_AT] = Date.now();
     const promptEcho = normalizePromptEcho(prompt);
     if (afterSubmit) {
-      await afterSubmit({ tabId, promptEcho, modelVerified, effortVerified });
+      await afterSubmit({ tabId, promptEcho, modelVerified, effortVerified, baseline });
     }
     log("Prompt sent, waiting for response...");
     const conversationUrl = await waitForConversationUrl(cdp, 30000, signal);
@@ -210,7 +230,6 @@ async function harvest(options) {
   const {
     tabId: liveTabId,
     conversationUrl,
-    promptEcho,
     baseline,
     timeout = 2700000,
     createTab,
@@ -245,34 +264,15 @@ async function harvest(options) {
 
     if (ownsTab) {
       await inputCdp("Page.navigate", { url: conversationUrl });
-      await waitForPageLoad(cdp, 45000, signal);
-      if (await isCloudflareBlocked(cdp)) {
-        throw codedError("Cloudflare challenge detected - complete in browser", "cloudflare");
-      }
-      const loginStatus = await checkLoginStatus(cdp);
-      if (loginStatus.status === 0) {
-        throw codedError(
-          loginStatus.error
-            ? `ChatGPT login check failed: ${loginStatus.error}`
-            : "ChatGPT login check failed",
-          "auth",
-        );
-      }
-      if (loginStatus.status !== 200 || loginStatus.hasLoginCta) {
-        throw codedError("ChatGPT login required", "auth");
-      }
+      await assertUsablePage(cdp, signal);
     }
 
-    const elapsedSinceSend = baseline?.[RESPONSE_STARTED_AT]
-      ? Date.now() - baseline[RESPONSE_STARTED_AT]
-      : 0;
     const response = await waitForResponse(
       cdp,
-      Math.max(0, timeout - elapsedSinceSend),
+      timeout,
       baseline?.latestAssistant,
       baseline?.assistantCount,
       signal,
-      baseline ? undefined : promptEcho,
     );
     log(`Response received (${response.text.length} chars)`);
     return {
@@ -313,7 +313,6 @@ async function query(options) {
       ...options,
       tabId: dispatched.tabId,
       conversationUrl: dispatched.conversationUrl,
-      promptEcho: dispatched.promptEcho,
       baseline: dispatched.baseline,
       timeout,
     });
@@ -338,7 +337,11 @@ module.exports = {
   query,
   dispatch,
   harvest,
+  assertUsablePage,
+  createResponseTracker,
   hasRequiredCookies,
+  readChatGPTResponseSnapshot,
+  waitForConversationUrl,
   cleanChatGPTResponseText,
   extractLatestAssistantSnapshot,
   normalizeChatGPTEffortChoice,
@@ -349,7 +352,6 @@ module.exports = {
   isChatGPTResponseComplete,
   isCloudflareBlocked,
   normalizePromptEcho,
-  matchesPromptEcho,
   extractConversationUrl,
   verifyChatGPTEffortSelection,
   verifyChatGPTModelSelection,

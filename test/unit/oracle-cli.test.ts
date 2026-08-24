@@ -75,6 +75,17 @@ describe("oracle CLI helpers", () => {
     });
   });
 
+  it("parses cancel and rejects it without exactly one job id", () => {
+    expect(parseOracleCommand(["oracle", "cancel", "job-1", "--json"])).toMatchObject({
+      command: "cancel",
+      id: "job-1",
+      json: true,
+    });
+    expect(() => parseOracleCommand(["oracle", "cancel"])).toThrow(
+      expect.objectContaining({ code: "not_found" }),
+    );
+  });
+
   it("preserves structured error codes and adds a recovery command", () => {
     const error = Object.assign(new Error("connection closed"), {
       code: "timeout",

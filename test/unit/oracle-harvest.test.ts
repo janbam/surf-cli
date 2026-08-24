@@ -1,0 +1,268 @@
+import { afterEach, vi } from "vitest";
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const oracleJobs = require("../../native/oracle-jobs.cjs");
+const { createHarvestSupervisor } = require("../../native/oracle-harvest.cjs");
+
+const CONVERSATION_URL = "https://chatgpt.com/c/6a8c33e1-6ffc-83eb-9d17-0a69c51d45f8";
+const EMPTY_BASELINE = { latestAssistant: null, assistantCount: 0, stopVisible: false };
+
+const roots: string[] = [];
+const originalStateDir = process.env.SURF_STATE_DIR;
+
+function useTempState() {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "surf-oracle-harvest-"));
+  roots.push(parent);
+  process.env.SURF_STATE_DIR = path.join(parent, "state");
+  return process.env.SURF_STATE_DIR;
+}
+
+function createBackgroundRequest(label: string) {
+  const controller = new AbortController();
+  return {
+    id: label,
+    tool: label,
+    startedAt: Date.now(),
+    deadlineMs: 60000,
+    controller,
+    signal: controller.signal,
+    context: { isRemote: false },
+    abort: (reason?: unknown) => controller.abort(reason),
+  };
+}
+
+type Snapshot = { candidates: unknown[]; stopVisible: boolean };
+
+/** One finished assistant turn: the DOM state a settled answer produces. */
+function finishedSnapshot(text: string): Snapshot {
+  return {
+    candidates: [
+      { role: "user", isUser: true, isAssistant: false, text: "question", hasFinishedActions: false },
+      {
+        role: "assistant",
+        isAssistant: true,
+        isUser: false,
+        text,
+        messageId: "message-1",
+        hasFinishedActions: true,
+      },
+    ],
+    stopVisible: false,
+  };
+}
+
+/**
+ * Minimal fake of the extension bridge.
+ *
+ * `evaluate` answers the page-health probes so fresh-tab recovery can run, and
+ * routes everything else to the conversation snapshot under test.
+ */
+function createBrowser({
+  tabs = [{ id: 7 }],
+  href = CONVERSATION_URL,
+  snapshots = [finishedSnapshot("The answer.")],
+  evaluateFailsOnTab,
+  newTabId = 9,
+}: {
+  tabs?: Array<{ id: number }>;
+  href?: string;
+  snapshots?: Snapshot[];
+  evaluateFailsOnTab?: number;
+  newTabId?: number;
+} = {}) {
+  const closed: number[] = [];
+  const created: number[] = [];
+  const queue = [...snapshots];
+  const evaluate = (tabId: number, expression: string) => {
+    if (evaluateFailsOnTab === tabId) throw new Error(`tab ${tabId} is gone`);
+    if (expression.includes("document.readyState")) return { result: { value: "complete" } };
+    if (expression.includes("document.title")) return { result: { value: "chatgpt" } };
+    if (expression.includes("cf-turnstile")) return { result: { value: false } };
+    if (expression.includes("backend-api/me")) {
+      return { result: { value: { status: 200, hasLoginCta: false } } };
+    }
+    if (expression === "location.href") return { result: { value: href } };
+    if (expression.includes("stopVisible")) {
+      return { result: { value: queue.length > 1 ? queue.shift() : queue[0] } };
+    }
+    throw new Error(`unexpected evaluate: ${expression.slice(0, 60)}`);
+  };
+
+  const options = {
+    signal: undefined,
+    createTab: async () => {
+      created.push(newTabId);
+      return { tabId: newTabId };
+    },
+    closeTab: async (tabId: number) => {
+      closed.push(tabId);
+    },
+    cdpEvaluate: async (tabId: number, expression: string) => evaluate(tabId, expression),
+    cdpCommand: async () => ({}),
+  };
+
+  return {
+    closed,
+    created,
+    supervisorOptions: {
+      queueAiRequest: (operation: () => unknown) => operation(),
+      createBackgroundRequest,
+      browserOptions: () => options,
+      closeTab: async (_request: unknown, tabId: number) => {
+        closed.push(tabId);
+      },
+      listTabs: async () => tabs,
+      log: () => {},
+    },
+  };
+}
+
+function dispatchedJob({
+  baseline = EMPTY_BASELINE,
+  conversationUrl,
+  tabId = 7,
+}: { baseline?: unknown; conversationUrl?: string; tabId?: number | null } = {}) {
+  const job = oracleJobs.createJob({ prompt: "question" });
+  oracleJobs.markDispatched(job.id, { tabId, promptEcho: "question", baseline });
+  if (conversationUrl) {
+    oracleJobs.markAwaiting(job.id, { conversationUrl, promptEcho: "question" });
+  }
+  return oracleJobs.getJob(job.id);
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const root of roots.splice(0)) {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  if (originalStateDir === undefined) delete process.env.SURF_STATE_DIR;
+  else process.env.SURF_STATE_DIR = originalStateDir;
+});
+
+describe("oracle harvest supervisor", () => {
+  it("captures a settled answer, links it to the job, and releases the tab", async () => {
+    useTempState();
+    const job = dispatchedJob({ conversationUrl: CONVERSATION_URL });
+    const browser = createBrowser();
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    await supervisor.watch(job.id);
+
+    expect(oracleJobs.getJob(job.id)).toMatchObject({ state: "captured" });
+    expect(oracleJobs.getResponse(job.id)).toBe("The answer.");
+    expect(browser.closed).toEqual([7]);
+  });
+
+  // The conversation URL is a recovery aid, not a precondition: an answer that
+  // is already on screen must never be thrown away for lack of one.
+  it("captures from the live tab even when no durable URL was ever recorded", async () => {
+    useTempState();
+    const job = dispatchedJob();
+    const browser = createBrowser({ href: "https://chatgpt.com/c/WEB:6a8c33e1-6ffc-83eb-9d17-0a69c51d45f8" });
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    await supervisor.watch(job.id);
+
+    expect(oracleJobs.getJob(job.id)).toMatchObject({
+      state: "captured",
+      conversationUrl: null,
+    });
+  });
+
+  it("promotes the job to awaiting once the durable conversation id appears", async () => {
+    useTempState();
+    const job = dispatchedJob();
+    const browser = createBrowser();
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    await supervisor.watch(job.id);
+
+    expect(oracleJobs.getJob(job.id)).toMatchObject({
+      state: "captured",
+      conversationUrl: CONVERSATION_URL,
+      awaitingAt: expect.any(String),
+    });
+  });
+
+  // Without a baseline the answer cannot be attributed to this job at all;
+  // spinning until the deadline would look identical to "still generating" and
+  // would hold the single capacity slot for an hour.
+  it("fails a job that has no dispatch baseline instead of waiting it out", async () => {
+    useTempState();
+    const job = dispatchedJob({ baseline: null, conversationUrl: CONVERSATION_URL });
+    const browser = createBrowser();
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    await supervisor.watch(job.id);
+
+    expect(oracleJobs.getJob(job.id)).toMatchObject({
+      state: "failed",
+      error: { code: "unattributable" },
+    });
+  });
+
+  it("reopens the conversation in a fresh tab after the dispatch tab dies", async () => {
+    useTempState();
+    const job = dispatchedJob({ conversationUrl: CONVERSATION_URL });
+    const browser = createBrowser({ evaluateFailsOnTab: 7 });
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    await supervisor.watch(job.id);
+
+    expect(browser.created).toEqual([9]);
+    expect(oracleJobs.getJob(job.id)).toMatchObject({ state: "captured", tabId: 9 });
+    expect(oracleJobs.getResponse(job.id)).toBe("The answer.");
+  });
+
+  it("fails with the web-history limitation when neither tab nor URL survive", async () => {
+    useTempState();
+    const job = dispatchedJob({ tabId: 7 });
+    const browser = createBrowser({ tabs: [] });
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    await supervisor.watch(job.id);
+
+    expect(oracleJobs.getJob(job.id)).toMatchObject({
+      state: "failed",
+      error: {
+        code: "harvest_failed",
+        message: expect.stringContaining("cannot be recovered without a conversation URL"),
+      },
+    });
+  });
+
+  it("cancels a watcher without deciding the job's terminal state", async () => {
+    useTempState();
+    const job = dispatchedJob({ conversationUrl: CONVERSATION_URL });
+    // A conversation that never settles keeps the watcher in its poll loop.
+    const browser = createBrowser({ snapshots: [{ candidates: [], stopVisible: true }] });
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    const watching = supervisor.watch(job.id);
+    expect(supervisor.cancel(job.id)).toBe(true);
+    await watching;
+
+    expect(oracleJobs.getJob(job.id)).toMatchObject({ state: "awaiting" });
+  });
+
+  it("resumes dispatched orphans and retires ones that never got sent", async () => {
+    useTempState();
+    const stranded = oracleJobs.createJob({ prompt: "never sent" });
+    const browser = createBrowser();
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    expect(supervisor.resume()).toEqual([stranded.id]);
+    expect(oracleJobs.getJob(stranded.id)).toMatchObject({
+      state: "failed",
+      error: { code: "dispatch_failed" },
+    });
+
+    // With the stranded record retired, capacity is free again.
+    const revived = dispatchedJob({ conversationUrl: CONVERSATION_URL });
+    expect(supervisor.resume()).toEqual([revived.id]);
+    await supervisor.stop();
+  });
+});

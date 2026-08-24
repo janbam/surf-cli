@@ -13,9 +13,16 @@ const {
 
 const JOB_ID_PATTERN = /^\d{8}-\d{6}-[0-9a-f]{4}$/;
 const TERMINAL_STATES = new Set(["captured", "failed"]);
+// A job whose harvest supervisor died leaves a non-terminal record behind, and
+// one such record blocks every later ask. Anything idle for longer than the
+// longest legitimate harvest is treated as abandoned rather than in flight.
+const STALE_JOB_MS = 60 * 60 * 1000;
+// `awaiting` records the durable conversation URL, which is a recovery aid and
+// not a precondition for capture: a job whose URL never became durable can
+// still be harvested from its live tab.
 const TRANSITIONS = {
   created: new Set(["dispatched", "failed"]),
-  dispatched: new Set(["awaiting", "failed"]),
+  dispatched: new Set(["awaiting", "captured", "failed"]),
   awaiting: new Set(["captured", "failed"]),
 };
 
@@ -73,6 +80,7 @@ function hydrateJobMetadata(job, root = getPrivateStateRoot()) {
   const legacyModel = job.modelRequested === undefined && job.modelVerified === undefined;
   return {
     ...job,
+    baseline: job.baseline ?? null,
     modelRequested: job.modelRequested ?? (legacyModel && job.state === "created" ? job.model ?? null : null),
     modelVerified: job.modelVerified ?? (legacyModel && job.state !== "created" ? job.model ?? null : null),
     promptDigest: job.promptDigest ?? promptDigest(prompt),
@@ -113,6 +121,9 @@ function createJob({ prompt, contextManifest = {}, model = null, effortRequested
       return { ...existing, requestDeduped: true };
     }
   }
+  // Release capacity held by abandoned records before enforcing the limit, so a
+  // dead supervisor cannot lock the subsystem out permanently.
+  reapStaleJobs(root);
   const inFlight = readJobs(root).find((job) => !TERMINAL_STATES.has(job.state));
   if (inFlight) {
     throw codedError(
@@ -160,6 +171,7 @@ function createJob({ prompt, contextManifest = {}, model = null, effortRequested
       tabId: null,
       conversationUrl: null,
       promptEcho: null,
+      baseline: null,
       error: null,
       turns: [],
       ...(follow ? { follow } : {}),
@@ -202,10 +214,18 @@ function transition(id, state, updates) {
   return updated;
 }
 
-function markDispatched(id, { tabId, promptEcho, modelVerified, effortVerified }) {
+/**
+ * Record the send as a durable fact.
+ *
+ * `baseline` is the conversation snapshot taken immediately before submitting;
+ * it is what later identifies this job's answer by turn identity, so it must be
+ * persisted here rather than kept in the dispatching process's memory.
+ */
+function markDispatched(id, { tabId, promptEcho, modelVerified, effortVerified, baseline }) {
   return transition(id, "dispatched", {
     dispatchedAt: new Date().toISOString(),
     tabId,
+    ...(baseline ? { baseline } : {}),
     ...(promptEcho ? { promptEcho } : {}),
     ...(modelVerified ? { model: modelVerified, modelVerified } : {}),
     ...(effortVerified ? { effortVerified } : {}),
@@ -302,6 +322,28 @@ function listJobs({ limit } = {}) {
   return limit === undefined ? jobs : jobs.slice(0, Math.max(0, limit));
 }
 
+/**
+ * Fail every non-terminal job that has been idle longer than STALE_JOB_MS.
+ *
+ * Returns the ids that were reaped. Idleness is measured from the last recorded
+ * state change, so a job actively being harvested is never touched.
+ */
+function reapStaleJobs(root = getPrivateStateRoot()) {
+  const cutoff = Date.now() - STALE_JOB_MS;
+  const reaped = [];
+  for (const job of readJobs(root)) {
+    if (TERMINAL_STATES.has(job.state)) continue;
+    const lastActivity = Date.parse(job.awaitingAt || job.dispatchedAt || job.createdAt);
+    if (Number.isFinite(lastActivity) && lastActivity > cutoff) continue;
+    markFailed(job.id, {
+      code: "stale",
+      message: `oracle job ${job.id} was abandoned in state ${job.state} and released for capacity`,
+    });
+    reaped.push(job.id);
+  }
+  return reaped;
+}
+
 function adoptOrphans() {
   return listJobs({}).filter((job) => !TERMINAL_STATES.has(job.state));
 }
@@ -319,5 +361,7 @@ module.exports = {
   markFailed,
   markTurnCaptured,
   oracleRoot,
+  reapStaleJobs,
+  STALE_JOB_MS,
   updateTabId,
 };

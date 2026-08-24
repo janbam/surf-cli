@@ -8,11 +8,6 @@ function normalizePromptEcho(prompt) {
     .slice(0, 200);
 }
 
-function matchesPromptEcho(text, promptEcho) {
-  const expected = normalizePromptEcho(promptEcho);
-  return expected.length > 0 && normalizePromptEcho(text) === expected;
-}
-
 function cleanChatGPTResponseText(rawText) {
   if (!rawText) return "";
 
@@ -154,23 +149,64 @@ function isChatGPTResponseComplete(snapshot, stableCycles, stableMs) {
   return stableCycles >= 6 && stableMs >= 1200;
 }
 
-function scopeSnapshotToPrompt(rawSnapshot, promptEcho) {
-  const candidates = Array.isArray(rawSnapshot?.candidates) ? rawSnapshot.candidates : [];
-  let userIndex = -1;
-  for (let index = candidates.length - 1; index >= 0; index--) {
-    const candidate = candidates[index];
-    if (candidate?.isUser && matchesPromptEcho(candidate.text, promptEcho)) {
-      userIndex = index;
-      break;
-    }
-  }
-  if (userIndex === -1) return { ...rawSnapshot, candidates: [] };
+/**
+ * Track assistant output across DOM snapshots and decide when the answer that
+ * belongs to one dispatch is finished.
+ *
+ * Identity comes from the pre-send baseline, not from the prompt text: any
+ * assistant content differing from the baseline turn (by message id, turn
+ * index, or text) is ours. The tracker owns the stability counters, so callers
+ * may poll at any cadence — including through a shared request queue.
+ *
+ * `ingest` returns the finished response once, or null while still waiting.
+ */
+function createResponseTracker({ baselineAssistant = null, baselineAssistantCount = 0 } = {}) {
+  let previousText = baselineAssistant?.text || "";
+  let stableCycles = 0;
+  let lastChangeAt = Date.now();
 
-  const following = candidates.slice(userIndex + 1);
-  const nextUserIndex = following.findIndex((candidate) => candidate?.isUser);
   return {
-    ...rawSnapshot,
-    candidates: nextUserIndex === -1 ? following : following.slice(0, nextUserIndex),
+    ingest(rawSnapshot) {
+      if (!rawSnapshot) return null;
+      const { latestAssistant, assistantCount, stopVisible } = normalizeResponseSnapshot(rawSnapshot);
+      // Ignore everything that is still the pre-send state of the conversation.
+      if (
+        !isNewAssistantContent(
+          latestAssistant,
+          baselineAssistant,
+          assistantCount,
+          baselineAssistantCount,
+        )
+      ) {
+        return null;
+      }
+
+      // Streaming text keeps resetting the stability window; only a settled
+      // turn may be treated as complete.
+      const currentText = latestAssistant?.text || "";
+      if (currentText !== previousText) {
+        previousText = currentText;
+        stableCycles = 0;
+        lastChangeAt = Date.now();
+      } else if (currentText) {
+        stableCycles++;
+      } else {
+        stableCycles = 0;
+        lastChangeAt = Date.now();
+      }
+
+      const completionSnapshot = latestAssistant
+        ? { ...latestAssistant, stopVisible }
+        : { text: "", stopVisible, hasFinishedActions: false };
+      if (!isChatGPTResponseComplete(completionSnapshot, stableCycles, Date.now() - lastChangeAt)) {
+        return null;
+      }
+      return {
+        text: latestAssistant.text,
+        messageId: latestAssistant.messageId,
+        turnIndex: latestAssistant.turnIndex,
+      };
+    },
   };
 }
 
@@ -256,67 +292,26 @@ async function readChatGPTResponseSnapshot(cdp) {
   );
 }
 
+/**
+ * Poll one tab until the dispatch identified by `baselineAssistant` finishes.
+ *
+ * Used by the direct (non-oracle) ChatGPT path, which owns its tab for the
+ * whole wait. The oracle drives the same tracker from its own queued poll loop.
+ */
 async function waitForResponse(
   cdp,
   timeoutMs = 2700000,
   baselineAssistant,
   baselineAssistantCount,
   signal,
-  promptEcho,
 ) {
   throwIfAborted(signal);
   const deadline = Date.now() + timeoutMs;
-  let previousText = baselineAssistant?.text || "";
-  let stableCycles = 0;
-  let lastChangeAt = Date.now();
+  const tracker = createResponseTracker({ baselineAssistant, baselineAssistantCount });
 
   while (Date.now() < deadline) {
-    const rawSnapshot = await readChatGPTResponseSnapshot(cdp);
-    const snapshot = promptEcho ? scopeSnapshotToPrompt(rawSnapshot, promptEcho) : rawSnapshot;
-
-    if (!snapshot) {
-      await delay(400, signal);
-      continue;
-    }
-
-    const { latestAssistant, assistantCount, stopVisible } = normalizeResponseSnapshot(snapshot);
-    const currentText = latestAssistant?.text || "";
-    const hasNewAssistantContent = isNewAssistantContent(
-      latestAssistant,
-      baselineAssistant,
-      assistantCount,
-      baselineAssistantCount,
-    );
-
-    if (!hasNewAssistantContent) {
-      await delay(400, signal);
-      continue;
-    }
-
-    if (currentText !== previousText) {
-      previousText = currentText;
-      stableCycles = 0;
-      lastChangeAt = Date.now();
-    } else if (currentText) {
-      stableCycles++;
-    } else {
-      stableCycles = 0;
-      lastChangeAt = Date.now();
-    }
-
-    const stableMs = Date.now() - lastChangeAt;
-    const completionSnapshot = latestAssistant
-      ? { ...latestAssistant, stopVisible }
-      : { text: "", stopVisible, hasFinishedActions: false };
-
-    if (isChatGPTResponseComplete(completionSnapshot, stableCycles, stableMs)) {
-      return {
-        text: latestAssistant.text,
-        messageId: latestAssistant.messageId,
-        turnIndex: latestAssistant.turnIndex,
-      };
-    }
-
+    const response = tracker.ingest(await readChatGPTResponseSnapshot(cdp));
+    if (response) return response;
     await delay(400, signal);
   }
 
@@ -325,10 +320,10 @@ async function waitForResponse(
 
 module.exports = {
   cleanChatGPTResponseText,
+  createResponseTracker,
   extractLatestAssistantSnapshot,
   isChatGPTResponseComplete,
   isNewAssistantContent,
-  matchesPromptEcho,
   normalizePromptEcho,
   normalizeResponseSnapshot,
   readChatGPTResponseSnapshot,

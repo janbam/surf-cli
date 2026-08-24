@@ -533,9 +533,12 @@ surf oracle ask "review this change" --files "src/**/*.ts" --model gpt-5.6-sol -
 surf oracle status <job-id> --json
 surf oracle result <job-id> --wait --json
 surf oracle follow <job-id> "challenge that recommendation" --detach --json
+surf oracle cancel <job-id> --json
 ```
 
-Only one oracle job can be in flight. Sensitive filename patterns and gitignored context are blocked unless `--allow-sensitive` is explicit.
+The native host harvests dispatched jobs itself: a background watcher polls the conversation and writes the captured answer or a failure into the job record with no client attached, and the host resumes those watchers after a restart. `result` waits for that watcher rather than harvesting on its own, so a client that disconnects or times out never loses the answer.
+
+Only one oracle job can be in flight. Cancel a job you no longer want with `surf oracle cancel <id>` to free the slot; jobs left idle for over an hour are reaped automatically. Sensitive filename patterns and gitignored context are blocked unless `--allow-sensitive` is explicit.
 
 Each AI tool uses your existing browser login - no API keys needed. Just be logged into the respective service in Chrome (chatgpt.com, gemini.google.com, perplexity.ai, x.com, or aistudio.google.com).
 

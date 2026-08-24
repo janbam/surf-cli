@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+- **Host-owned oracle harvesting** - The native host now polls a dispatched consult to completion by itself and writes `captured`/`failed` into the job record, instead of only harvesting while a client is calling `oracle.result`. Watchers poll in short queued bursts, so a long generation no longer blocks other browser work, and they are resumed after a host restart. Captures now land within seconds of the answer settling rather than minutes.
+- **`surf oracle cancel <id>`** - Abandon a job, stop its watcher, close its tab, and release the single-job capacity slot. Also exposed to Pi as `surf_oracle_cancel`.
+
+### Fixed
+- **Unrecoverable oracle jobs** - Dispatch now persists the pre-send conversation baseline, so a job's answer is identified by turn identity instead of matching the prompt text in the DOM. A job that cannot be attributed fails immediately with `unattributable` rather than spinning until timeout and returning to `awaiting` forever.
+- **False conversation URLs** - Only ChatGPT's durable server-side conversation id is recorded. The transient `WEB:` placeholder id used to be persisted as the job's recovery key, which pointed later recovery attempts at a different conversation.
+- **Wedged oracle capacity** - Non-terminal jobs idle for over an hour are reaped, and jobs left in `created` by a host restart are retired, so one lost job can no longer block every later consult.
+
 ### Changed
 - **ChatGPT Plus support for oracle model/effort selection** - Rewrote `selectModel`/`selectEffort` for the current composer layout: one pill labeled with the active effort (Instant/Medium/High) opening Model/Effort submenu radios. Added `instant`, `medium`, and `high` to the accepted effort vocabulary. The renamed `gpt` package agent now pins GPT-5.6 Sol with High effort for Plus accounts (replacing the Pro-tier `gpt-pro`).
 - **Merge upstream 2.16.x** - Absorbed Surf Oracle external-job hardening (bounded terminal harvests, follow-up dispatch, request-id idempotency, durable follow lineage), dependency refreshes, and releases 2.16.0/2.16.1. The upstream ChatGPT Pro picker fixes (#217–#221) target the Pro-account interface and are intentionally not carried; this fork keeps its Plus-composer selection flow.

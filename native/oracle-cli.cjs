@@ -2,10 +2,14 @@ const { openClientTransport } = require("./client-transport.cjs");
 const { resolveRequestDeadlineMs } = require("./host-sessions.cjs");
 const { assembleContext } = require("./oracle-context.cjs");
 
-const RESULT_TIMEOUT_SECONDS = 20;
-const POLL_DELAYS_MS = [5000, 10000, 20000, 40000, 60000];
+// The host harvests on its own and `oracle.result` blocks until the job
+// settles, so waiting is one long server-side call plus a token gap rather than
+// a client-side backoff ladder.
+const RESULT_TIMEOUT_SECONDS = 30;
+const POLL_GAP_MS = 1000;
 const ORACLE_ERROR_CODES = new Set([
   "auth",
+  "cancelled",
   "capacity",
   "cloudflare",
   "context_incomplete",
@@ -17,21 +21,24 @@ const ORACLE_ERROR_CODES = new Set([
   "rate_limit",
   "remote_unsupported",
   "sensitive_blocked",
+  "stale",
   "timeout",
+  "unattributable",
 ]);
-const HELP = `Usage: surf oracle <ask|status|result|follow|list>
+const HELP = `Usage: surf oracle <ask|status|result|follow|cancel|list>
 
 Commands:
   ask <prompt>            Start a consult and wait for its response
   follow <id> <prompt>    Continue a captured consult
   status [id]             Show a job (newest when id is omitted)
-  result <id> [--wait]    Try to capture a result, optionally keep waiting
+  result <id> [--wait]    Read a result, optionally keep waiting
+  cancel <id>             Abandon a job and release capacity
   list                    List jobs newest-first
 
 Ask/follow options:
   --files <glob>          Add context files (repeatable)
   --model <model>         Select model: instant, thinking, pro, gpt-5.5, gpt-5.6-sol
-  --effort <effort>       Select effort: light, standard, extended, heavy, pro
+  --effort <effort>       Select effort: instant, medium, high
   --detach                Return after dispatch
   --allow-sensitive       Allow deny-listed context files
 
@@ -114,7 +121,7 @@ function parseOracleCommand(argv) {
   if (!command || command === "help" || command === "--help" || command === "-h") {
     return { handled: true, command: "help", json: false };
   }
-  if (!["ask", "follow", "status", "result", "list"].includes(command)) {
+  if (!["ask", "follow", "status", "result", "cancel", "list"].includes(command)) {
     throw codedError("invalid_transition", `Unknown oracle command: ${command}`);
   }
   const parsed = parseOptions(argv.slice(2));
@@ -157,6 +164,14 @@ function parseOracleCommand(argv) {
       allowSensitive: parsed.options["allow-sensitive"] === true,
       json,
     };
+  }
+
+  if (command === "cancel") {
+    const id = parsed.positional[0];
+    if (parsed.positional.length !== 1 || !id?.trim()) {
+      throw codedError("not_found", "Usage: surf oracle cancel <id>");
+    }
+    return { handled: true, command, id, json };
   }
 
   if (command === "status") {
@@ -294,7 +309,6 @@ async function waitForResult(job, spec, io) {
 
   try {
     let current = job;
-    let pollIndex = 0;
     while (current.state !== "captured") {
       try {
         current = await requestHost(
@@ -323,9 +337,7 @@ async function waitForResult(job, spec, io) {
         );
       }
       if (current.state !== "captured") {
-        const delayMs = POLL_DELAYS_MS[Math.min(pollIndex, POLL_DELAYS_MS.length - 1)];
-        pollIndex += 1;
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await new Promise((resolve) => setTimeout(resolve, POLL_GAP_MS));
       }
     }
     return current;
@@ -357,6 +369,15 @@ async function handleOracleCli(argv, {
       return { handled: true, value, json: spec.json };
     } catch (error) {
       throw classifyError(error, "timeout");
+    }
+  }
+  if (spec.command === "cancel") {
+    try {
+      const value = await requestHost(endpoint, "oracle.cancel", { id: spec.id });
+      return { handled: true, value, json: spec.json };
+    } catch (error) {
+      error.jobId ||= spec.id;
+      throw classifyError(error, "not_found");
     }
   }
   if (spec.command === "list") {

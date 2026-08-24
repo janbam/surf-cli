@@ -23,7 +23,7 @@ const { SOCKET_PATH, SURF_TMP } = require("./socket-path.cjs");
 const { parseListenEndpoint } = require("./listener.cjs");
 const { getStateDir } = require("./remote-auth.cjs");
 const { createFrameParser, createServerAuthSession, createSocketWriter, isClientAuthorized, writeFrame, MAX_FRAME_BYTES } = require("./remote-transport.cjs");
-const { HostSessionManager, resolveRequestDeadlineMs } = require("./host-sessions.cjs");
+const { HostSessionManager, MAX_DEADLINE_MS, resolveRequestDeadlineMs } = require("./host-sessions.cjs");
 const { abortError, abortableDelay, throwIfAborted } = require("./abort.cjs");
 const { BoundedAiQueue } = require("./ai-queue.cjs");
 const { RequestPendingMap } = require("./request-pending.cjs");
@@ -488,14 +488,39 @@ aiQueue = new BoundedAiQueue({
     : handler(),
 });
 
+/**
+ * Mint a request context for work the host owns itself, with no client socket
+ * behind it.
+ *
+ * Client requests die when their connection or deadline does; background work
+ * such as oracle harvesting must survive that, so it gets its own abort
+ * controller and an explicit `abort()` instead of a session-managed timer.
+ */
+function createBackgroundRequest(label) {
+  const controller = new AbortController();
+  return {
+    id: `background-${label}-${Date.now()}`,
+    tool: label,
+    startedAt: Date.now(),
+    deadlineMs: MAX_DEADLINE_MS,
+    queued: false,
+    settled: false,
+    controller,
+    signal: controller.signal,
+    context: { isRemote: false },
+    abort: (reason) => controller.abort(reason),
+  };
+}
+
 const oracleHost = createOracleHost({
   queueAiRequest,
   requestCallExtension,
+  createBackgroundRequest,
   buildProviderUploadMessage,
   log,
 });
-const adoptedOracleJobs = oracleHost.adoptOrphans();
-log(`Oracle adoption: ${adoptedOracleJobs.length} job(s); ids=${adoptedOracleJobs.map((job) => job.id).join(",") || "none"}`);
+const resumedOracleJobs = oracleHost.resumeHarvest();
+log(`Oracle harvest resume: ${resumedOracleJobs.length} job(s); ids=${resumedOracleJobs.join(",") || "none"}`);
 
 function sendSocket(socket, value, options = {}) {
   const writer = socketWriters.get(socket);
@@ -2936,6 +2961,9 @@ function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   const cleanupPromises = [...connectedSockets].map((socket) => socket.transferCleanup?.() || Promise.resolve());
+  // Stop background harvesting before the sockets go: job records stay as they
+  // are, so the next host process resumes exactly these jobs.
+  cleanupPromises.push(Promise.resolve(oracleHost.stopHarvest()));
   for (const socket of connectedSockets) socket.destroy();
   pendingRequests.clear(); pendingToolRequests.clear(); activeStreams.clear();
   Promise.allSettled([...cleanupPromises, Promise.resolve(listenerLifecycle?.shutdown())]).finally(scheduleExit);

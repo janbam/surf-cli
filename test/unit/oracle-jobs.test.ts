@@ -54,6 +54,7 @@ describe("oracle job registry", () => {
       "tabId",
       "conversationUrl",
       "promptEcho",
+      "baseline",
       "error",
       "turns",
     ]);
@@ -62,6 +63,7 @@ describe("oracle job registry", () => {
       tabId: 42,
       modelVerified: "ChatGPT 5.4 Pro",
       effortVerified: "Extended",
+      baseline: { latestAssistant: null, assistantCount: 0, stopVisible: false },
     });
     jobs.markAwaiting(created.id, {
       conversationUrl: "https://chatgpt.com/c/conversation-id",
@@ -91,6 +93,7 @@ describe("oracle job registry", () => {
       tabId: 42,
       conversationUrl: "https://chatgpt.com/c/conversation-id",
       promptEcho: "Review this verbatim.",
+      baseline: { latestAssistant: null, assistantCount: 0, stopVisible: false },
       error: null,
     });
     expect(captured.dispatchedAt).toEqual(expect.any(String));
@@ -265,6 +268,32 @@ describe("oracle job registry", () => {
 
     expect(jobs.adoptOrphans()).toEqual([before]);
     expect(jobs.getJob(orphan.id)).toEqual(before);
+  });
+
+  // One abandoned record used to block every later ask forever, recoverable
+  // only by deleting state by hand.
+  it("reaps abandoned jobs so capacity cannot stay wedged", () => {
+    useTempState();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-29T12:00:00.000Z"));
+    const abandoned = jobs.createJob({ prompt: "abandoned" });
+    jobs.markDispatched(abandoned.id, { tabId: 7, promptEcho: "abandoned" });
+
+    // Still inside the harvest window: a slow job must not be reaped.
+    vi.setSystemTime(new Date(Date.parse("2026-07-29T12:00:00.000Z") + jobs.STALE_JOB_MS - 1000));
+    expect(jobs.reapStaleJobs()).toEqual([]);
+    expect(() => jobs.createJob({ prompt: "blocked" })).toThrow(
+      expect.objectContaining({ code: "capacity", jobId: abandoned.id }),
+    );
+
+    vi.setSystemTime(new Date(Date.parse("2026-07-29T12:00:00.000Z") + jobs.STALE_JOB_MS + 1000));
+    const revived = jobs.createJob({ prompt: "unblocked" });
+
+    expect(jobs.getJob(abandoned.id)).toMatchObject({
+      state: "failed",
+      error: { code: "stale" },
+    });
+    expect(revived.state).toBe("created");
   });
 
   it("lists jobs newest-first and honors the limit", () => {
