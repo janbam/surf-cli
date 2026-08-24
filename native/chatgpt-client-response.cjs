@@ -244,6 +244,20 @@ async function readChatGPTResponseSnapshot(cdp) {
           ? turnNode
           : turnNode.querySelector('[data-message-author-role], [data-turn]');
         const searchRoot = resolvedMessageRoot || authorRoot || turnNode;
+        // The durable message id and the author role live on an inner node; the
+        // turn wrapper only carries data-turn. Resolving identity from the
+        // wrapper leaves every turn anonymous, which silently demotes
+        // attribution to comparing rendered text.
+        const turnHint = turnNode.getAttribute?.('data-turn') || null;
+        const idNodes = [
+          ...(searchRoot.matches?.('[data-message-id]') ? [searchRoot] : []),
+          ...Array.from(searchRoot.querySelectorAll?.('[data-message-id]') || []),
+          ...Array.from(turnNode.querySelectorAll?.('[data-message-id]') || []),
+        ];
+        const identityRoot =
+          idNodes.find((node) => !turnHint || node.getAttribute('data-message-author-role') === turnHint) ||
+          idNodes[0] ||
+          null;
         let contentRoot = null;
 
         for (const selector of CONTENT_SELECTORS) {
@@ -257,6 +271,7 @@ async function readChatGPTResponseSnapshot(cdp) {
         }
 
         const role =
+          identityRoot?.getAttribute('data-message-author-role') ||
           resolvedMessageRoot?.getAttribute('data-message-author-role') ||
           authorRoot?.getAttribute('data-message-author-role') ||
           turnNode.getAttribute('data-message-author-role') ||
@@ -273,6 +288,7 @@ async function readChatGPTResponseSnapshot(cdp) {
         const isUser = role === 'user' || turn === 'user';
         const text = (contentRoot || turnNode).innerText || (contentRoot || turnNode).textContent || '';
         const messageId =
+          identityRoot?.getAttribute('data-message-id') ||
           resolvedMessageRoot?.getAttribute('data-message-id') ||
           turnNode.getAttribute('data-message-id') ||
           null;
