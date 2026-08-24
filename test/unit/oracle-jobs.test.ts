@@ -296,6 +296,29 @@ describe("oracle job registry", () => {
     expect(revived.state).toBe("created");
   });
 
+  // A harvest resumed after a host restart can be older than the cutoff while
+  // its watcher is actively polling; the heartbeat is what keeps the reaper
+  // from retiring a job out from under a live watcher.
+  it("spares a job whose watcher is still reporting a heartbeat", () => {
+    useTempState();
+    vi.useFakeTimers();
+    const dispatchedAt = Date.parse("2026-07-29T12:00:00.000Z");
+    vi.setSystemTime(new Date(dispatchedAt));
+    const job = jobs.createJob({ prompt: "long harvest" });
+    jobs.markDispatched(job.id, { tabId: 7, promptEcho: "long harvest" });
+
+    // Well past the cutoff measured from dispatch, but freshly claimed.
+    vi.setSystemTime(new Date(dispatchedAt + jobs.STALE_JOB_MS + 60_000));
+    jobs.touchHarvest(job.id);
+
+    expect(jobs.reapStaleJobs()).toEqual([]);
+    expect(jobs.getJob(job.id).state).toBe("dispatched");
+
+    // Once the heartbeat itself goes stale, the record is abandoned.
+    vi.setSystemTime(new Date(dispatchedAt + 2 * jobs.STALE_JOB_MS + 120_000));
+    expect(jobs.reapStaleJobs()).toEqual([job.id]);
+  });
+
   it("lists jobs newest-first and honors the limit", () => {
     useTempState();
     vi.useFakeTimers();

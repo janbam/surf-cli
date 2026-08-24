@@ -178,8 +178,9 @@ function createOracleHost({
         recoverable.recoverable = true;
         throw recoverable;
       }
-      // Nothing reached ChatGPT, so the job is dead. Record why, unless the
-      // client aborted and may still want to inspect the record.
+      // Either nothing reached ChatGPT, or the record was retired underneath
+      // this dispatch (a concurrent cancel). Record why, unless the client
+      // aborted or the job already ended.
       if (error?.code !== "SURF_REQUEST_ABORTED" && !TERMINAL_STATES.has(current.state)) {
         oracleJobs.markFailed(created.id, {
           code: error?.code || "dispatch_failed",

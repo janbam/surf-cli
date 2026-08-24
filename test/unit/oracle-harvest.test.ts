@@ -40,7 +40,13 @@ type Snapshot = { candidates: unknown[]; stopVisible: boolean };
 function finishedSnapshot(text: string, messageId = "message-1"): Snapshot {
   return {
     candidates: [
-      { role: "user", isUser: true, isAssistant: false, text: "question", hasFinishedActions: false },
+      {
+        role: "user",
+        isUser: true,
+        isAssistant: false,
+        text: "question",
+        hasFinishedActions: false,
+      },
       {
         role: "assistant",
         isAssistant: true,
@@ -76,19 +82,25 @@ function createBrowser({
   const closed: number[] = [];
   const created: number[] = [];
   const queue = [...snapshots];
+  // Page-health probes answer statically; the conversation probe walks the
+  // scripted snapshots and then repeats the last one.
+  const answers: Array<[string, () => unknown]> = [
+    ["document.readyState", () => "complete"],
+    ["document.title", () => "chatgpt"],
+    ["cf-turnstile", () => false],
+    ["backend-api/me", () => ({ status: 200, hasLoginCta: false })],
+    ["location.href", () => href],
+    ["stopVisible", () => (queue.length > 1 ? queue.shift() : queue[0])],
+  ];
   const evaluate = (tabId: number, expression: string) => {
-    if (evaluateFailsOnTab === tabId) throw new Error(`tab ${tabId} is gone`);
-    if (expression.includes("document.readyState")) return { result: { value: "complete" } };
-    if (expression.includes("document.title")) return { result: { value: "chatgpt" } };
-    if (expression.includes("cf-turnstile")) return { result: { value: false } };
-    if (expression.includes("backend-api/me")) {
-      return { result: { value: { status: 200, hasLoginCta: false } } };
+    if (evaluateFailsOnTab === tabId) {
+      throw new Error(`tab ${tabId} is gone`);
     }
-    if (expression === "location.href") return { result: { value: href } };
-    if (expression.includes("stopVisible")) {
-      return { result: { value: queue.length > 1 ? queue.shift() : queue[0] } };
+    const answer = answers.find(([marker]) => expression.includes(marker));
+    if (!answer) {
+      throw new Error(`unexpected evaluate: ${expression.slice(0, 60)}`);
     }
-    throw new Error(`unexpected evaluate: ${expression.slice(0, 60)}`);
+    return { result: { value: answer[1]() } };
   };
 
   const options = {
@@ -115,7 +127,7 @@ function createBrowser({
         closed.push(tabId);
       },
       listTabs: async () => tabs,
-      log: () => {},
+      log: vi.fn(),
     },
   };
 }
@@ -124,7 +136,11 @@ function dispatchedJob({
   baseline = EMPTY_BASELINE,
   conversationUrl,
   tabId = 7,
-}: { baseline?: unknown; conversationUrl?: string; tabId?: number | null } = {}) {
+}: {
+  baseline?: unknown;
+  conversationUrl?: string;
+  tabId?: number | null;
+} = {}) {
   const job = oracleJobs.createJob({ prompt: "question" });
   oracleJobs.markDispatched(job.id, { tabId, promptEcho: "question", baseline });
   if (conversationUrl) {
@@ -138,8 +154,11 @@ afterEach(() => {
   for (const root of roots.splice(0)) {
     fs.rmSync(root, { recursive: true, force: true });
   }
-  if (originalStateDir === undefined) delete process.env.SURF_STATE_DIR;
-  else process.env.SURF_STATE_DIR = originalStateDir;
+  if (originalStateDir === undefined) {
+    delete process.env.SURF_STATE_DIR;
+  } else {
+    process.env.SURF_STATE_DIR = originalStateDir;
+  }
 });
 
 describe("oracle harvest supervisor", () => {
@@ -161,7 +180,9 @@ describe("oracle harvest supervisor", () => {
   it("captures from the live tab even when no durable URL was ever recorded", async () => {
     useTempState();
     const job = dispatchedJob();
-    const browser = createBrowser({ href: "https://chatgpt.com/c/WEB:6a8c33e1-6ffc-83eb-9d17-0a69c51d45f8" });
+    const browser = createBrowser({
+      href: "https://chatgpt.com/c/WEB:6a8c33e1-6ffc-83eb-9d17-0a69c51d45f8",
+    });
     const supervisor = createHarvestSupervisor(browser.supervisorOptions);
 
     await supervisor.watch(job.id);

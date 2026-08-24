@@ -61,11 +61,15 @@ function createBackgroundRequest(label: string) {
  */
 function idleBrowser(tabId = 7) {
   return vi.fn(async (_request: unknown, tool: string) => {
-    if (tool === "list_tabs") return { tabs: [{ id: tabId }] };
+    if (tool === "list_tabs") {
+      return { tabs: [{ id: tabId }] };
+    }
     if (tool === "cdp_evaluate") {
       return { result: { value: { candidates: [], stopVisible: true } } };
     }
-    if (tool === "cdp_command" || tool === "close_tab") return {};
+    if (tool === "cdp_command" || tool === "close_tab") {
+      return {};
+    }
     throw new Error(`Unexpected extension call: ${tool}`);
   });
 }
@@ -82,7 +86,9 @@ function createHost(requestCallExtension: ReturnType<typeof vi.fn>) {
   return host;
 }
 
-function mockDispatch(overrides: Partial<{ tabId: number; conversationUrl: string; promptEcho: string }> = {}) {
+function mockDispatch(
+  overrides: Partial<{ tabId: number; conversationUrl: string; promptEcho: string }> = {},
+) {
   const dispatched = {
     tabId: 7,
     conversationUrl: CONVERSATION_URL,
@@ -100,7 +106,9 @@ function mockDispatch(overrides: Partial<{ tabId: number; conversationUrl: strin
 }
 
 afterEach(async () => {
-  for (const host of hosts.splice(0)) await host.stopHarvest();
+  for (const host of hosts.splice(0)) {
+    await host.stopHarvest();
+  }
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) {
     fs.rmSync(root, { recursive: true, force: true });
@@ -190,7 +198,11 @@ describe("oracle host dispatch", () => {
   it("records follow turns with child and request identity", async () => {
     useTempState();
     const parent = oracleJobs.createJob({ prompt: "first" });
-    oracleJobs.markDispatched(parent.id, { tabId: 6, promptEcho: "first", baseline: EMPTY_BASELINE });
+    oracleJobs.markDispatched(parent.id, {
+      tabId: 6,
+      promptEcho: "first",
+      baseline: EMPTY_BASELINE,
+    });
     oracleJobs.markAwaiting(parent.id, {
       conversationUrl: CONVERSATION_URL,
       promptEcho: "first",
@@ -249,8 +261,12 @@ describe("oracle host dispatch", () => {
       });
     });
     const requestCallExtension = vi.fn(async (_request: unknown, tool: string) => {
-      if (tool === "create_tab") return { tabId: 7 };
-      if (tool === "close_tab") return {};
+      if (tool === "create_tab") {
+        return { tabId: 7 };
+      }
+      if (tool === "close_tab") {
+        return {};
+      }
       throw new Error(`Unexpected extension call: ${tool}`);
     });
     const host = createHost(requestCallExtension);
