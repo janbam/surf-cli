@@ -118,12 +118,13 @@ function isNewAssistantContent(
 ) {
   if (!latestAssistant) return false;
   if (!baselineAssistant) return true;
-  if (
-    latestAssistant.messageId &&
-    baselineAssistant.messageId &&
-    latestAssistant.messageId !== baselineAssistant.messageId
-  ) {
-    return true;
+  // Message ids are the strongest identity signal available: when both turns
+  // carry one, it decides the question outright. Falling through to the text
+  // and index heuristics below would let a re-rendered baseline turn (a late
+  // reasoning preamble, or a different turn count in a reopened tab) be
+  // reported as this dispatch's answer.
+  if (latestAssistant.messageId && baselineAssistant.messageId) {
+    return latestAssistant.messageId !== baselineAssistant.messageId;
   }
 
   const currentText = latestAssistant.text || "";

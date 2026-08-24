@@ -37,7 +37,7 @@ function createBackgroundRequest(label: string) {
 type Snapshot = { candidates: unknown[]; stopVisible: boolean };
 
 /** One finished assistant turn: the DOM state a settled answer produces. */
-function finishedSnapshot(text: string): Snapshot {
+function finishedSnapshot(text: string, messageId = "message-1"): Snapshot {
   return {
     candidates: [
       { role: "user", isUser: true, isAssistant: false, text: "question", hasFinishedActions: false },
@@ -46,7 +46,7 @@ function finishedSnapshot(text: string): Snapshot {
         isAssistant: true,
         isUser: false,
         text,
-        messageId: "message-1",
+        messageId,
         hasFinishedActions: true,
       },
     ],
@@ -246,6 +246,33 @@ describe("oracle harvest supervisor", () => {
     await watching;
 
     expect(oracleJobs.getJob(job.id)).toMatchObject({ state: "awaiting" });
+  });
+
+  // A follow-up dispatches into a conversation that already holds a finished
+  // answer. That turn re-renders (late reasoning summaries, a different turn
+  // count in a reopened tab), and treating the drift as new content would hand
+  // the parent's answer back as the follow-up's response.
+  it("ignores the baseline turn re-rendering and captures only the next answer", async () => {
+    useTempState();
+    const job = dispatchedJob({
+      conversationUrl: CONVERSATION_URL,
+      baseline: {
+        latestAssistant: { text: "PARENT ANSWER", messageId: "parent-1", turnIndex: 1 },
+        assistantCount: 1,
+        stopVisible: false,
+      },
+    });
+    const browser = createBrowser({
+      snapshots: [
+        finishedSnapshot("PARENT ANSWER\nThought for 12s", "parent-1"),
+        finishedSnapshot("The follow-up answer.", "child-1"),
+      ],
+    });
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    await supervisor.watch(job.id);
+
+    expect(oracleJobs.getResponse(job.id)).toBe("The follow-up answer.");
   });
 
   it("resumes dispatched orphans and retires ones that never got sent", async () => {

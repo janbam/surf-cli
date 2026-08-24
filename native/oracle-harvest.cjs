@@ -9,6 +9,9 @@ const HARVEST_DEADLINE_MS = 45 * 60 * 1000;
 // Idle time between queued DOM probes. Each probe is one CDP evaluate, so the
 // supervisor never holds the shared AI queue while waiting for the model.
 const POLL_IDLE_MS = 1500;
+// How often a live watcher writes its heartbeat, so the staleness reaper can
+// tell a working harvest from an abandoned record without a write per poll.
+const HEARTBEAT_MS = 60 * 1000;
 const TERMINAL_STATES = new Set(["captured", "failed"]);
 
 function codedError(code, message, details = {}) {
@@ -129,6 +132,10 @@ function createHarvestSupervisor({
       );
     }
 
+    // Claim the job before the first poll: resume() may be adopting a record
+    // whose last state change is already older than the staleness cutoff.
+    oracleJobs.touchHarvest(jobId);
+    let nextHeartbeatAt = Date.now() + HEARTBEAT_MS;
     let tabId = await ensureConversationTab(job, request);
     const tracker = chatgptClient.createResponseTracker({
       baselineAssistant: job.baseline.latestAssistant,
@@ -153,6 +160,11 @@ function createHarvestSupervisor({
         retriedFreshTab = true;
         tabId = await ensureConversationTab({ ...job, tabId: null }, request);
         continue;
+      }
+
+      if (Date.now() >= nextHeartbeatAt) {
+        oracleJobs.touchHarvest(jobId);
+        nextHeartbeatAt = Date.now() + HEARTBEAT_MS;
       }
 
       const response = tracker.ingest(snapshot);

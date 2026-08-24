@@ -473,10 +473,21 @@ describe("chatgpt-client", () => {
         1,
         false,
       ],
+      // Same message id means the same turn, however much its rendered text
+      // drifts. Treating a re-rendered baseline turn as new content is how a
+      // follow-up job would capture its parent's answer.
       [
-        "text changed",
-        { text: "New answer", messageId: "msg-1" },
-        { text: "Old answer", messageId: "msg-1" },
+        "baseline turn re-rendered under the same message id",
+        { text: "Old answer\nThought for 12s", messageId: "msg-1", turnIndex: 2 },
+        { text: "Old answer", messageId: "msg-1", turnIndex: 1 },
+        3,
+        2,
+        false,
+      ],
+      [
+        "text changed without message ids",
+        { text: "New answer", messageId: null, turnIndex: 0 },
+        { text: "Old answer", messageId: null, turnIndex: 0 },
         2,
         2,
         true,

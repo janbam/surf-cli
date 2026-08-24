@@ -296,6 +296,19 @@ describe("oracle host result", () => {
     ).rejects.toMatchObject({ code: "cancelled", jobId: job.id });
   });
 
+  // Nothing outside its own dispatch can advance a `created` job, so polling
+  // one forever would be a wedge with extra steps.
+  it("retires a job whose dispatch is gone instead of reporting it as pending", async () => {
+    useTempState();
+    const job = oracleJobs.createJob({ prompt: "review" });
+    const host = createHost(vi.fn());
+
+    await expect(
+      host.handle(LOCAL_REQUEST, { type: "ORACLE_RESULT", id: job.id }),
+    ).rejects.toMatchObject({ code: "dispatch_failed", jobId: job.id });
+    expect(oracleJobs.getJob(job.id)).toMatchObject({ state: "failed" });
+  });
+
   // The supervisor keeps working after the wait window closes; a client that
   // times out gets the current record instead of an error or a wedged job.
   it("returns the unfinished job when the harvest outlives the wait window", async () => {

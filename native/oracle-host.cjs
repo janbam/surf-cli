@@ -91,6 +91,10 @@ function createOracleHost({
     listTabs,
     log,
   });
+  // Jobs whose dispatch is still running in this process. A `created` record is
+  // otherwise indistinguishable from one whose dispatch died, and only this set
+  // can tell the two apart.
+  const dispatching = new Set();
 
   async function ask(request, args) {
     assertLocalOracleRequest(request);
@@ -105,6 +109,7 @@ function createOracleHost({
     });
     if (created.requestDeduped) return oracleJobs.getJob(created.id);
     let createdTabId = null;
+    dispatching.add(created.id);
 
     try {
       let parent = null;
@@ -164,32 +169,32 @@ function createOracleHost({
       const current = oracleJobs.getJob(created.id);
       // Once the job leaves `created` the prompt is already in ChatGPT. Hand it
       // to the supervisor and report the failure as recoverable instead of
-      // discarding an answer that is on its way.
-      if (
-        error?.code !== "SURF_REQUEST_ABORTED"
-        && (current.state === "dispatched" || current.state === "awaiting")
-      ) {
+      // discarding an answer that is on its way. This holds for aborts too: a
+      // client disconnect or request deadline says nothing about the answer
+      // ChatGPT is already writing, and `oracle cancel` is the way to drop it.
+      if (current.state === "dispatched" || current.state === "awaiting") {
         supervisor.watch(created.id);
         const recoverable = withJobId(error, created.id, "dispatch_failed");
         recoverable.recoverable = true;
         throw recoverable;
       }
+      // Nothing reached ChatGPT, so the job is dead. Record why, unless the
+      // client aborted and may still want to inspect the record.
       if (error?.code !== "SURF_REQUEST_ABORTED" && !TERMINAL_STATES.has(current.state)) {
         oracleJobs.markFailed(created.id, {
           code: error?.code || "dispatch_failed",
           message: error?.message || String(error),
         });
       }
-      const keepForManualClearance = ["auth", "cloudflare"].includes(error?.code)
-        && current.state === "created";
-      if (
-        createdTabId
-        && !keepForManualClearance
-        && (error?.code !== "SURF_REQUEST_ABORTED" || current.state === "created")
-      ) {
+      // Login and Cloudflare walls need a human in that tab; everything else
+      // leaves nothing worth keeping open.
+      const keepForManualClearance = ["auth", "cloudflare"].includes(error?.code);
+      if (createdTabId && !keepForManualClearance) {
         await closeTab(request, createdTabId).catch(() => {});
       }
       throw withJobId(error, created.id, "dispatch_failed");
+    } finally {
+      dispatching.delete(created.id);
     }
   }
 
@@ -216,7 +221,19 @@ function createOracleHost({
   async function result(request, args) {
     assertLocalOracleRequest(request);
     let job = oracleJobs.getJob(args.id);
-    if (job.state === "created") return job;
+    // A `created` job is only alive while its own dispatch is running. Once
+    // that is gone nothing can ever advance it, so retire it loudly instead of
+    // handing the caller a job it would poll forever.
+    if (job.state === "created") {
+      if (dispatching.has(job.id)) return job;
+      oracleJobs.markFailed(job.id, {
+        code: "dispatch_failed",
+        message: `oracle job ${job.id} was never dispatched; its prompt never reached ChatGPT`,
+      });
+      throw codedError("dispatch_failed", `oracle job ${job.id} was never dispatched`, {
+        jobId: job.id,
+      });
+    }
     if (!TERMINAL_STATES.has(job.state)) {
       // Adopt jobs whose watcher never started or died with the previous host.
       supervisor.watch(job.id);

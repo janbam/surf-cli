@@ -263,6 +263,22 @@ function markFailed(id, { code, message }) {
   });
 }
 
+/**
+ * Record that a harvest supervisor is still working on this job.
+ *
+ * Without this heartbeat the staleness reaper measures from the last state
+ * change, and a long harvest resumed after a host restart would be reaped out
+ * from under its own live watcher.
+ */
+function touchHarvest(id) {
+  const job = getJob(id);
+  if (TERMINAL_STATES.has(job.state)) return job;
+  const updated = { ...job, harvestedAt: new Date().toISOString() };
+  const root = getPrivateStateRoot();
+  atomicWriteJson(path.join(jobDirectory(id, root), "job.json"), updated, { root });
+  return updated;
+}
+
 function updateTabId(id, tabId) {
   const job = getJob(id);
   if (TERMINAL_STATES.has(job.state)) {
@@ -325,15 +341,17 @@ function listJobs({ limit } = {}) {
 /**
  * Fail every non-terminal job that has been idle longer than STALE_JOB_MS.
  *
- * Returns the ids that were reaped. Idleness is measured from the last recorded
- * state change, so a job actively being harvested is never touched.
+ * Returns the ids that were reaped. Idleness is measured from the harvest
+ * heartbeat when there is one, so a job with a live watcher is never touched.
  */
 function reapStaleJobs(root = getPrivateStateRoot()) {
   const cutoff = Date.now() - STALE_JOB_MS;
   const reaped = [];
   for (const job of readJobs(root)) {
     if (TERMINAL_STATES.has(job.state)) continue;
-    const lastActivity = Date.parse(job.awaitingAt || job.dispatchedAt || job.createdAt);
+    const lastActivity = Date.parse(
+      job.harvestedAt || job.awaitingAt || job.dispatchedAt || job.createdAt,
+    );
     if (Number.isFinite(lastActivity) && lastActivity > cutoff) continue;
     markFailed(job.id, {
       code: "stale",
@@ -363,5 +381,6 @@ module.exports = {
   oracleRoot,
   reapStaleJobs,
   STALE_JOB_MS,
+  touchHarvest,
   updateTabId,
 };

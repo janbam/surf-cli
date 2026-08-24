@@ -2961,9 +2961,12 @@ function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   const cleanupPromises = [...connectedSockets].map((socket) => socket.transferCleanup?.() || Promise.resolve());
-  // Stop background harvesting before the sockets go: job records stay as they
-  // are, so the next host process resumes exactly these jobs.
-  cleanupPromises.push(Promise.resolve(oracleHost.stopHarvest()));
+  // Abort background harvesting before the sockets go: job records stay as they
+  // are, so the next host process resumes exactly these jobs. Aborting is
+  // synchronous; do not wait for the watchers to unwind, because one parked in
+  // a cleanup extension call would never settle after pendingToolRequests is
+  // cleared below and would hold the process open forever.
+  oracleHost.stopHarvest().catch(() => {});
   for (const socket of connectedSockets) socket.destroy();
   pendingRequests.clear(); pendingToolRequests.clear(); activeStreams.clear();
   Promise.allSettled([...cleanupPromises, Promise.resolve(listenerLifecycle?.shutdown())]).finally(scheduleExit);
