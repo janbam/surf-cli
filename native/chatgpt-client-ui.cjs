@@ -233,17 +233,35 @@ async function clickSubmenuRow(cdp, kind) {
   );
 }
 
+// Prefer visible text, but fall back through aria-labelledby / aria-label /
+// title when a radio renders its name outside its own text content.
+const resolveRadioLabelSource = `
+  const resolveLabel = (el) => {
+    const direct = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (direct) return direct;
+    const labelledBy = String(el.getAttribute?.('aria-labelledby') || '')
+      .split(/\\s+/)
+      .map((id) => document.getElementById(id)?.textContent || '')
+      .join(' ');
+    const parts = [el.getAttribute?.('aria-label'), labelledBy, el.getAttribute?.('title')]
+      .map((value) => String(value || '').replace(/\\s+/g, ' ').trim())
+      .filter(Boolean);
+    return parts.join(' | ');
+  };
+`;
+
 // Visible radios deduped by label: nested menu containers can surface the same
 // entry twice, and downstream uniqueness checks would break on duplicates.
 async function readVisibleRadios(cdp) {
   return evaluate(
     cdp,
     `(() => {
+      ${resolveRadioLabelSource}
       const seen = new Set();
       const radios = [];
       for (const el of document.querySelectorAll('[role="menuitemradio"]')) {
         if (el.offsetParent === null) continue;
-        const text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+        const text = resolveLabel(el);
         if (!text || seen.has(text)) continue;
         seen.add(text);
         radios.push({ role: 'menuitemradio', label: text, checked: el.getAttribute('aria-checked') === 'true' });
@@ -258,9 +276,10 @@ async function clickRadio(cdp, label) {
     cdp,
     `(() => {
       ${buildClickDispatcher()}
+      ${resolveRadioLabelSource}
       const expected = ${JSON.stringify(label)};
       const targets = Array.from(document.querySelectorAll('[role="menuitemradio"]'))
-        .filter((el) => el.offsetParent !== null && (el.textContent || '').replace(/\\s+/g, ' ').trim() === expected);
+        .filter((el) => el.offsetParent !== null && resolveLabel(el) === expected);
       return targets.length >= 1 ? dispatchClickSequence(targets[targets.length - 1]) : false;
     })()`,
   );

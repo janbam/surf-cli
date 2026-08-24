@@ -156,7 +156,7 @@ describe("Pi extension", () => {
 
   it("creates the optional pi-subagents external-job provider registry lazily", () => {
     delete (globalThis as Record<PropertyKey, unknown>)[externalJobProviderKey];
-    const provider = createOracleExternalJobProvider("pi-session", new Set(), vi.fn());
+    const provider = createOracleExternalJobProvider(new Set(), vi.fn());
 
     const dispose = registerGlobalExternalJobProvider(provider);
     const registry = (
@@ -213,7 +213,6 @@ describe("Pi extension", () => {
         }
       | undefined;
     const dispose = registerOptionalExternalJobProvider(
-      "pi-session",
       new Set(),
       (registered: typeof provider) => {
         provider = registered;
@@ -226,6 +225,7 @@ describe("Pi extension", () => {
 
     expect(provider?.name).toBe("surf-oracle");
     expect(Object.keys(provider ?? {}).sort()).toEqual([
+      "followUp",
       "name",
       "reattach",
       "result",
@@ -241,18 +241,20 @@ describe("Pi extension", () => {
     const requests: Array<{ tool: string; args: Record<string, unknown> }> = [];
     const request = vi.fn(async (tool: string, args: Record<string, unknown>) => {
       requests.push({ tool, args });
-      const id = tool === "oracle.ask" ? "job-started" : String(args.id);
-      return {
-        content: [{ type: "text", text: "{}" }],
-        details: {
-          id,
-          state: tool === "oracle.result" ? "captured" : "awaiting",
-          conversationUrl: "https://chatgpt.com/c/conversation-id",
-          ...(tool === "oracle.result" ? { response: "answer\n" } : {}),
-        },
+      const details: Record<string, unknown> = {
+        id: tool === "oracle.ask" ? "job-started" : String(args.id),
+        state: "awaiting",
+        conversationUrl: "https://chatgpt.com/c/conversation-id",
       };
+      if (tool === "oracle.result") {
+        details.state = "captured";
+        details.response = "answer\n";
+      }
+      return { content: [{ type: "text", text: "{}" }], details };
     });
-    const provider = createOracleExternalJobProvider("pi-session", jobIds, request);
+    const provider = createOracleExternalJobProvider(jobIds, request, undefined, undefined, {
+      followUp: true,
+    });
 
     await expect(
       provider.start({
@@ -268,7 +270,7 @@ describe("Pi extension", () => {
     });
     await expect(provider.status("job-started")).resolves.toMatchObject({
       providerJobId: "job-started",
-      state: "running",
+      state: "completed",
     });
     await expect(provider.result("job-started")).resolves.toEqual({
       providerJobId: "job-started",
@@ -281,28 +283,143 @@ describe("Pi extension", () => {
     expect(jobIds.has("job-started")).toBe(true);
     expect(requests).toEqual([
       { tool: "oracle.ask", args: { prompt: "review", model: "pro", effort: "pro" } },
-      { tool: "oracle.status", args: { id: "job-started" } },
+      { tool: "oracle.result", args: { id: "job-started", timeout: 5 } },
       { tool: "oracle.result", args: { id: "job-started" } },
-      { tool: "oracle.result", args: { id: "job-started" } },
+      { tool: "oracle.result", args: { id: "job-started", timeout: 5 } },
+    ]);
+  });
+
+  it("falls back to oracle.status when bounded status harvest reports a failed job", async () => {
+    const requests: Array<{ tool: string; args: Record<string, unknown> }> = [];
+    const provider = createOracleExternalJobProvider(
+      new Set(),
+      async (tool: string, args: Record<string, unknown>) => {
+        requests.push({ tool, args });
+        if (tool === "oracle.result") {
+          return {
+            content: [{ type: "text", text: "harvest failed" }],
+            details: { code: "harvest_failed", jobId: "failed-job", message: "harvest failed" },
+            isError: true,
+          };
+        }
+        return {
+          content: [{ type: "text", text: "{}" }],
+          details: {
+            id: "failed-job",
+            state: "failed",
+            error: { code: "harvest_failed", message: "harvest failed" },
+          },
+        };
+      },
+    );
+
+    await expect(provider.status("failed-job")).resolves.toEqual({
+      providerJobId: "failed-job",
+      state: "failed",
+      failureCode: "harvest_failed",
+      failureMessage: "harvest failed",
+    });
+    expect(requests).toEqual([
+      { tool: "oracle.result", args: { id: "failed-job", timeout: 5 } },
+      { tool: "oracle.status", args: { id: "failed-job" } },
+    ]);
+  });
+
+  it("preserves aborted oracle requests without fallback or terminal wake events", async () => {
+    const emitted: Array<{ id: string; state: string }> = [];
+    const request = vi.fn(async () => ({
+      content: [{ type: "text", text: "request aborted" }],
+      details: { code: "SURF_REQUEST_ABORTED", jobId: "running-job", message: "request aborted" },
+      isError: true,
+    }));
+    const provider = createOracleExternalJobProvider(
+      new Set(),
+      request,
+      undefined,
+      (job: { id: string; state: string }) => {
+        emitted.push(job);
+        return true;
+      },
+    );
+
+    await expect(provider.status("running-job")).rejects.toMatchObject({
+      code: "SURF_REQUEST_ABORTED",
+      jobId: "running-job",
+    });
+    await expect(provider.result("running-job")).rejects.toMatchObject({
+      code: "SURF_REQUEST_ABORTED",
+      jobId: "running-job",
+    });
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(emitted).toEqual([]);
+  });
+
+  it("maps external-job follow-ups to Surf Oracle follow requests", async () => {
+    const jobIds = new Set<string>();
+    const requests: Array<{ tool: string; args: Record<string, unknown> }> = [];
+    const provider = createOracleExternalJobProvider(
+      jobIds,
+      async (tool: string, args: Record<string, unknown>) => {
+        requests.push({ tool, args });
+        return {
+          content: [{ type: "text", text: "{}" }],
+          details: {
+            id: "follow-job",
+            state: "awaiting",
+            follow: args.follow,
+            requestId: args.requestId,
+          },
+        };
+      },
+      undefined,
+      undefined,
+      { followUp: true },
+    );
+
+    await expect(
+      provider.followUp?.({
+        parentProviderJobId: "parent-job",
+        prompt: "continue",
+        requestId: "follow-request",
+        options: { model: "pro", effort: "pro" },
+      }),
+    ).resolves.toMatchObject({ providerJobId: "follow-job", state: "running" });
+
+    expect(jobIds.has("follow-job")).toBe(true);
+    expect(requests).toEqual([
+      {
+        tool: "oracle.ask",
+        args: {
+          prompt: "continue",
+          follow: "parent-job",
+          model: "pro",
+          effort: "pro",
+          requestId: "follow-request",
+        },
+      },
     ]);
   });
 
   it("maps failed oracle jobs to pi failure fields and rejects unknown states", async () => {
     const provider = createOracleExternalJobProvider(
-      "pi-session",
       new Set(),
-      async (_tool: string, args: Record<string, unknown>) => ({
-        content: [{ type: "text", text: "{}" }],
-        details:
-          args.id === "weird-job"
-            ? { id: "weird-job", state: "harvesting" }
-            : {
-                id: "failed-job",
-                state: "failed",
-                conversationUrl: null,
-                error: { code: "harvest_failed", message: " harvest failed " },
-              },
-      }),
+      async (_tool: string, args: Record<string, unknown>) => {
+        let details: Record<string, unknown>;
+        if (args.id === "weird-job") {
+          details = { id: "weird-job", state: "harvesting" };
+        } else if (args.id === "malformed-job") {
+          details = { id: "malformed-job", state: "failed", error: { code: 500 } };
+        } else {
+          details = {
+            id: "failed-job",
+            state: "failed",
+            conversationUrl: null,
+            error: { code: "harvest_failed", message: " harvest failed " },
+          };
+        }
+        return { content: [{ type: "text", text: "{}" }], details };
+      },
     );
 
     await expect(provider.status("failed-job")).resolves.toEqual({
@@ -312,11 +429,12 @@ describe("Pi extension", () => {
       failureMessage: "harvest failed",
     });
     await expect(provider.status("weird-job")).rejects.toThrow(/unknown state 'harvesting'/);
+    await expect(provider.status("malformed-job")).rejects.toThrow(/invalid failure code/);
   });
 
   it("registers reattached active jobs as background work", async () => {
     const jobIds = new Set<string>();
-    const provider = createOracleExternalJobProvider("pi-session", jobIds, async () => ({
+    const provider = createOracleExternalJobProvider(jobIds, async () => ({
       content: [{ type: "text", text: "{}" }],
       details: {
         id: "existing-job",
@@ -347,7 +465,6 @@ describe("Pi extension", () => {
   it("emits the oracle finished wake channel for provider result capture", async () => {
     const emitted: Array<{ id: string; state: string }> = [];
     const provider = createOracleExternalJobProvider(
-      "pi-session",
       new Set(),
       async () => ({
         content: [{ type: "text", text: "{}" }],
@@ -360,10 +477,12 @@ describe("Pi extension", () => {
       },
     );
 
+    await provider.status("done");
     await provider.result("done");
     await provider.reattach("done");
 
     expect(emitted).toEqual([
+      { id: "done", state: "captured" },
       { id: "done", state: "captured" },
       { id: "done", state: "captured" },
     ]);
@@ -372,7 +491,6 @@ describe("Pi extension", () => {
   it("emits the oracle finished wake channel for provider result failures", async () => {
     const emitted: Array<{ id: string; state: string }> = [];
     const provider = createOracleExternalJobProvider(
-      "pi-session",
       new Set(),
       async () => ({
         content: [{ type: "text", text: "harvest failed" }],
@@ -403,7 +521,6 @@ describe("Pi extension", () => {
   it("does not emit terminal wake events for request errors without job ids", async () => {
     const emitted: Array<{ id: string; state: string }> = [];
     const provider = createOracleExternalJobProvider(
-      "pi-session",
       new Set(),
       async () => ({
         content: [{ type: "text", text: "oracle job not found" }],
@@ -434,12 +551,8 @@ describe("Pi extension", () => {
           resolveRequest = resolve;
         }),
     );
-    const provider = createOracleExternalJobProvider(
-      "old-session",
-      jobIds,
-      request,
-      (jobId: string) =>
-        rememberOracleJobForSession(jobIds, jobId, 1, currentGeneration, sessionActive),
+    const provider = createOracleExternalJobProvider(jobIds, request, (jobId: string) =>
+      rememberOracleJobForSession(jobIds, jobId, 1, currentGeneration, sessionActive),
     );
 
     const started = provider.start({ prompt: "review" });
@@ -465,7 +578,7 @@ describe("Pi extension", () => {
       },
       isError: true,
     }));
-    const provider = createOracleExternalJobProvider("pi-session", new Set(), request);
+    const provider = createOracleExternalJobProvider(new Set(), request);
 
     await expect(provider.start({ prompt: "review" })).rejects.toMatchObject({
       code: "capacity",
