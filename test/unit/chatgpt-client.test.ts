@@ -377,6 +377,12 @@ describe("chatgpt-client", () => {
 
     it.each([
       ["requested effort found", [effortOptions[2]], "extended", "Extended"],
+      [
+        "plus radio with Effort-prefixed label",
+        [{ role: "menuitemradio", label: "EffortHigh", checked: true, testId: null }],
+        "high",
+        "EffortHigh",
+      ],
       ["requested effort missing", [effortOptions[1]], "extended", null],
       ["ambiguous effort state", [effortOptions[2], effortOptions[2]], "extended", null],
       [

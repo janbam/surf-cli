@@ -81,8 +81,13 @@ function modelCandidateMatches(item, targetModel) {
 }
 
 function effortCandidateMatches(item, targetEffort) {
+  // Plus radios concatenate the group prefix onto their value ("EffortHigh"),
+  // so strip it before extracting effort words; Pro-era labels are untouched.
+  const rawLabel = String(item?.label || "");
+  const stripped = rawLabel.replace(/^effort/i, "").trim();
+  const label = stripped || rawLabel;
   const labelVariants = new Set(
-    normalizedWords(item?.label).filter((word) => CHATGPT_EFFORT_CHOICES.includes(word)),
+    normalizedWords(label).filter((word) => CHATGPT_EFFORT_CHOICES.includes(word)),
   );
   if (labelVariants.size > 0) {
     return labelVariants.size === 1 && labelVariants.has(targetEffort);
