@@ -34,7 +34,9 @@ The old verification step only asserted the composer was **non-empty**, so the f
 
 Fix applied: select existing composer contents instead of collapsing the caret (textareas use `node.select()`), then assert the composer contains **exactly** the intended prompt (whitespace-normalized equality). On mismatch, overwrite wholesale via the existing fallback, re-read, and throw if it still differs. This converts silent corruption into a loud failure and makes `promptEcho` trustworthy.
 
-Unvalidated assumption: that CDP `Input.insertText` replaces the current selection rather than inserting at its start. The hard equality check makes the code fail closed either way, but confirm behavior in a live run.
+Upstream's #221 clearing block was deliberately **not** ported verbatim. It sets `node.textContent = ''` (or `node.value = ''`) and fires a synthetic `InputEvent`. ChatGPT's composer is ProseMirror-backed, and mutating its DOM directly is a good way to desync the editor's internal document state; driving the real input pipeline via selection plus `Input.insertText` is closer to what a human does. The equivalent of upstream's overwrite already exists here as the fallback branch, which assigns `editor.textContent = prompt` wholesale — it now runs whenever the composer content does not match exactly, instead of only when the composer is empty, and its result is re-verified. Do not re-add upstream's block on top without a reason; the coverage is already there.
+
+Unvalidated assumption: that CDP `Input.insertText` replaces the current selection rather than inserting at its start. If a live run shows it does not, the verification catches it and the overwrite fallback takes over, so behavior stays correct either way — but confirm which path is actually being exercised, because silently relying on the fallback would hide a broken primary path.
 
 ### B. Transient conversation URL is recorded as durable
 
