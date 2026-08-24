@@ -168,6 +168,8 @@ function createJob({ prompt, contextManifest = {}, model = null, effortRequested
       awaitingAt: null,
       capturedAt: null,
       failedAt: null,
+      // Liveness heartbeat of the harvest watcher, not a completion time.
+      watchedAt: null,
       tabId: null,
       conversationUrl: null,
       promptEcho: null,
@@ -264,16 +266,17 @@ function markFailed(id, { code, message }) {
 }
 
 /**
- * Record that a harvest supervisor is still working on this job.
+ * Stamp `watchedAt`: a harvest supervisor is alive and working on this job.
  *
- * Without this heartbeat the staleness reaper measures from the last state
- * change, and a long harvest resumed after a host restart would be reaped out
- * from under its own live watcher.
+ * This is a liveness heartbeat, not a completion time — it is written when a
+ * watcher claims the job and refreshed while it polls. Without it the staleness
+ * reaper measures from the last state change, and a long harvest resumed after
+ * a host restart would be reaped out from under its own live watcher.
  */
 function touchHarvest(id) {
   const job = getJob(id);
   if (TERMINAL_STATES.has(job.state)) return job;
-  const updated = { ...job, harvestedAt: new Date().toISOString() };
+  const updated = { ...job, watchedAt: new Date().toISOString() };
   const root = getPrivateStateRoot();
   atomicWriteJson(path.join(jobDirectory(id, root), "job.json"), updated, { root });
   return updated;
@@ -350,7 +353,7 @@ function reapStaleJobs(root = getPrivateStateRoot()) {
   for (const job of readJobs(root)) {
     if (TERMINAL_STATES.has(job.state)) continue;
     const lastActivity = Date.parse(
-      job.harvestedAt || job.awaitingAt || job.dispatchedAt || job.createdAt,
+      job.watchedAt || job.awaitingAt || job.dispatchedAt || job.createdAt,
     );
     if (Number.isFinite(lastActivity) && lastActivity > cutoff) continue;
     markFailed(job.id, {

@@ -72,16 +72,24 @@ function createBrowser({
   snapshots = [finishedSnapshot("The answer.")],
   evaluateFailsOnTab,
   newTabId = 9,
+  transientFailures = 0,
+  listTabsTransientFailures = 0,
 }: {
   tabs?: Array<{ id: number }>;
   href?: string;
   snapshots?: Snapshot[];
   evaluateFailsOnTab?: number;
   newTabId?: number;
+  /** Extension timeouts to raise from the first N evaluate calls. */
+  transientFailures?: number;
+  /** Extension timeouts to raise from the first N tab listings. */
+  listTabsTransientFailures?: number;
 } = {}) {
   const closed: number[] = [];
   const created: number[] = [];
   const queue = [...snapshots];
+  let remainingTransientFailures = transientFailures;
+  let remainingListTabsFailures = listTabsTransientFailures;
   // Page-health probes answer statically; the conversation probe walks the
   // scripted snapshots and then repeats the last one.
   const answers: Array<[string, () => unknown]> = [
@@ -95,6 +103,12 @@ function createBrowser({
   const evaluate = (tabId: number, expression: string) => {
     if (evaluateFailsOnTab === tabId) {
       throw new Error(`tab ${tabId} is gone`);
+    }
+    // Models the extension still warming up after a host restart: the call
+    // times out with no verdict about the tab or the job.
+    if (remainingTransientFailures > 0) {
+      remainingTransientFailures--;
+      throw new Error("Timeout waiting for extension: cdp_evaluate");
     }
     const answer = answers.find(([marker]) => expression.includes(marker));
     if (!answer) {
@@ -126,8 +140,16 @@ function createBrowser({
       closeTab: async (_request: unknown, tabId: number) => {
         closed.push(tabId);
       },
-      listTabs: async () => tabs,
+      listTabs: async () => {
+        if (remainingListTabsFailures > 0) {
+          remainingListTabsFailures--;
+          throw new Error("Timeout waiting for extension: list_tabs");
+        }
+        return tabs;
+      },
       log: vi.fn(),
+      // The retry policy is under test, not the wait between retries.
+      failureRetryMs: 10,
     },
   };
 }
@@ -236,6 +258,35 @@ describe("oracle harvest supervisor", () => {
     expect(browser.created).toEqual([9]);
     expect(oracleJobs.getJob(job.id)).toMatchObject({ state: "captured", tabId: 9 });
     expect(oracleJobs.getResponse(job.id)).toBe("The answer.");
+  });
+
+  // Live regression: a watcher resumed after a host restart hit two consecutive
+  // 30s extension timeouts and killed a job whose answer was already written.
+  // Extension timeouts describe the connection, not the job.
+  it("rides out extension timeouts instead of failing the job", async () => {
+    useTempState();
+    const job = dispatchedJob({ conversationUrl: CONVERSATION_URL });
+    const browser = createBrowser({ listTabsTransientFailures: 1, transientFailures: 2 });
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    await supervisor.watch(job.id);
+
+    expect(oracleJobs.getJob(job.id)).toMatchObject({ state: "captured" });
+    expect(oracleJobs.getResponse(job.id)).toBe("The answer.");
+  });
+
+  // Retries are bounded by wall time, not attempts, so a tab that never becomes
+  // usable must not be left behind on every attempt.
+  it("closes a fresh tab that never became usable", async () => {
+    useTempState();
+    const job = dispatchedJob({ tabId: null, conversationUrl: CONVERSATION_URL });
+    const browser = createBrowser({ tabs: [], transientFailures: 1 });
+    const supervisor = createHarvestSupervisor(browser.supervisorOptions);
+
+    await supervisor.watch(job.id);
+
+    expect(browser.closed).toContain(9);
+    expect(oracleJobs.getJob(job.id)).toMatchObject({ state: "captured" });
   });
 
   it("fails with the web-history limitation when neither tab nor URL survive", async () => {

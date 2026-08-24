@@ -62,6 +62,20 @@ function cleanChatGPTResponseText(rawText) {
     lines.splice(trailingChromeStart);
   }
 
+  // Some layouts render the action row above the message body, so the same
+  // chrome vocabulary leaks in at the head ("Edit" prefixed live answers).
+  // A single line is enough to strip here: unlike the trailing row, a real
+  // answer does not open with a bare one-word action label.
+  let leadingChromeEnd = 0;
+  while (leadingChromeEnd < lines.length && lines[leadingChromeEnd].isChrome) {
+    leadingChromeEnd++;
+  }
+  // Unless that is all there is: a reply consisting solely of "Copy" is a real
+  // answer, and erasing it would be worse than leaving a label in.
+  if (leadingChromeEnd > 0 && leadingChromeEnd < lines.length) {
+    lines.splice(0, leadingChromeEnd);
+  }
+
   while (lines.length > 0 && lines[0].trimmed.length === 0) {
     lines.shift();
   }

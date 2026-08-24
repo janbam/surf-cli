@@ -51,6 +51,7 @@ describe("oracle job registry", () => {
       "awaitingAt",
       "capturedAt",
       "failedAt",
+      "watchedAt",
       "tabId",
       "conversationUrl",
       "promptEcho",

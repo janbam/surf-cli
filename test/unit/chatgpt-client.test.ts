@@ -55,9 +55,16 @@ describe("chatgpt-client", () => {
   describe("cleanChatGPTResponseText", () => {
     it.each([
       [
-        "trims outer blank lines and strips only trailing chrome clusters",
+        "trims outer blank lines and strips chrome at both ends",
         ["", "Copy", "Answer line", "Read aloud", "Share", ""].join("\n"),
-        "Copy\nAnswer line",
+        "Answer line",
+      ],
+      // Observed live: some layouts render the action row above the message,
+      // so captured answers arrived with an "Edit" line glued to the front.
+      [
+        "strips a leading action label from the captured answer",
+        ["Edit", "", "The real answer.", "", "More answer."].join("\n"),
+        "The real answer.\n\nMore answer.",
       ],
       [
         "preserves markdown and code fences",
@@ -70,9 +77,7 @@ describe("chatgpt-client", () => {
           "```",
           "Retry",
         ].join("\r\n"),
-        ["Good response", "Here is code:", "```js", "Copy", "const x = 1;", "```", "Retry"].join(
-          "\n",
-        ),
+        ["Here is code:", "```js", "Copy", "const x = 1;", "```", "Retry"].join("\n"),
       ],
       ["preserves legitimate standalone single-word response: Copy", "Copy", "Copy"],
       ["preserves legitimate standalone single-word response: Edit", "Edit", "Edit"],

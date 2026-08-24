@@ -9,6 +9,7 @@ const RESULT_TIMEOUT_SECONDS = 30;
 const POLL_GAP_MS = 1000;
 const ORACLE_ERROR_CODES = new Set([
   "auth",
+  "baseline_unavailable",
   "cancelled",
   "capacity",
   "cloudflare",
@@ -42,6 +43,10 @@ Ask/follow options:
   --detach                Return after dispatch
   --allow-sensitive       Allow deny-listed context files
 
+Result options:
+  --wait                  Keep waiting until the job settles
+  --timeout <seconds>     How long one wait may block (default 30)
+
 Options:
   --json                  Output machine-readable JSON
   --no-lock               Bypass the browser request lock`;
@@ -61,10 +66,26 @@ function requireOptionValue(argv, index, name) {
   return value;
 }
 
+/**
+ * Read `--timeout <seconds>` as the ceiling for a single blocking wait.
+ *
+ * Returns the default when the flag is absent. The host caps the real wait, so
+ * this only decides how long the client is willing to hold still; nonsense
+ * values are rejected rather than silently normalized into a surprise.
+ */
+function parseTimeoutSeconds(raw) {
+  if (raw === undefined) return RESULT_TIMEOUT_SECONDS;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw codedError("invalid_transition", `--timeout must be a positive number of seconds`);
+  }
+  return seconds;
+}
+
 function parseOptions(argv) {
   const positional = [];
   const options = { files: [] };
-  const valueOptions = new Set(["files", "model", "effort"]);
+  const valueOptions = new Set(["files", "model", "effort", "timeout"]);
   const booleanOptions = new Set([
     "allow-sensitive",
     "detach",
@@ -106,7 +127,7 @@ function assertAllowedOptions(command, options) {
   ]);
   const allowed = command === "ask" || command === "follow"
     ? ask
-    : command === "result" ? new Set([...common, "wait"]) : common;
+    : command === "result" ? new Set([...common, "wait", "timeout"]) : common;
   for (const [name, value] of Object.entries(options)) {
     if (name === "files" && value.length === 0) continue;
     if (value !== undefined && !allowed.has(name)) {
@@ -183,13 +204,14 @@ function parseOracleCommand(argv) {
 
   if (command === "result") {
     if (parsed.positional.length !== 1 || !parsed.positional[0].trim()) {
-      throw codedError("not_found", "Usage: surf oracle result <id> [--wait]");
+      throw codedError("not_found", "Usage: surf oracle result <id> [--wait] [--timeout <seconds>]");
     }
     return {
       handled: true,
       command,
       id: parsed.positional[0],
       wait: parsed.options.wait === true,
+      timeout: parseTimeoutSeconds(parsed.options.timeout),
       json,
     };
   }
@@ -316,7 +338,7 @@ async function waitForResult(job, spec, io) {
           "oracle.result",
           {
             id: current.id,
-            timeout: RESULT_TIMEOUT_SECONDS,
+            timeout: spec.timeout ?? RESULT_TIMEOUT_SECONDS,
           },
           io.withBrowserLock,
         );
@@ -399,7 +421,7 @@ async function handleOracleCli(argv, {
         "oracle.result",
         {
           id: spec.id,
-          timeout: RESULT_TIMEOUT_SECONDS,
+          timeout: spec.timeout ?? RESULT_TIMEOUT_SECONDS,
         },
         withBrowserLock,
       );

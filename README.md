@@ -532,11 +532,14 @@ Use `surf oracle` for a durable, local ChatGPT consult instead of a quick `surf 
 surf oracle ask "review this change" --files "src/**/*.ts" --model gpt-5.6-sol --effort high --detach --json
 surf oracle status <job-id> --json
 surf oracle result <job-id> --wait --json
+surf oracle result <job-id> --timeout 5 --json
 surf oracle follow <job-id> "challenge that recommendation" --detach --json
 surf oracle cancel <job-id> --json
 ```
 
-The native host harvests dispatched jobs itself: a background watcher polls the conversation and writes the captured answer or a failure into the job record with no client attached, and the host resumes those watchers after a restart. `result` waits for that watcher rather than harvesting on its own, so a client that disconnects or times out never loses the answer.
+The native host harvests dispatched jobs itself: a background watcher polls the conversation and writes the captured answer or a failure into the job record with no client attached, and the host resumes those watchers after a restart. `result` waits for that watcher rather than harvesting on its own, so a client that disconnects or times out never loses the answer; `--timeout <seconds>` bounds a single wait and returns the unfinished job instead of blocking.
+
+A follow-up is attributed by the conversation baseline captured before its prompt is sent, so dispatch refuses to send until the reopened conversation has rendered its turns. Watchers treat browser round-trip failures as transient for several minutes, which covers the extension still warming up after a host restart.
 
 Only one oracle job can be in flight. Cancel a job you no longer want with `surf oracle cancel <id>` to free the slot; jobs left idle for over an hour are reaped automatically. Sensitive filename patterns and gitignored context are blocked unless `--allow-sensitive` is explicit.
 

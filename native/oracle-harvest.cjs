@@ -12,6 +12,18 @@ const POLL_IDLE_MS = 1500;
 // How often a live watcher writes its heartbeat, so the staleness reaper can
 // tell a working harvest from an abandoned record without a write per poll.
 const HEARTBEAT_MS = 60 * 1000;
+// A browser round trip can fail for reasons that have nothing to do with the
+// job: the extension is still warming up after a host restart, or one request
+// gets dropped. Those are weather. The watcher rides them out and only gives up
+// once the browser has been unreachable for this long without a single answer.
+const UNREACHABLE_PATIENCE_MS = 5 * 60 * 1000;
+// How many times a conversation may be reopened in a fresh tab before that
+// theory is exhausted and the watcher just keeps polling what it has.
+const MAX_REOPENS = 3;
+const FAILURE_RETRY_MS = 2000;
+// Errors that describe the job itself rather than the connection to the
+// browser. Everything else is assumed transient until patience runs out.
+const FATAL_CODES = new Set(["harvest_failed", "auth", "cloudflare", "unattributable"]);
 const TERMINAL_STATES = new Set(["captured", "failed"]);
 
 function codedError(code, message, details = {}) {
@@ -41,6 +53,9 @@ function createHarvestSupervisor({
   closeTab,
   listTabs,
   log = () => {},
+  // Pause after a failed browser step. Injectable so tests can exercise the
+  // retry policy without sleeping through it.
+  failureRetryMs = FAILURE_RETRY_MS,
 }) {
   const watchers = new Map();
 
@@ -72,11 +87,21 @@ function createHarvestSupervisor({
     }
     const tabId = await step(request, async (options) => {
       const tabInfo = await options.createTab();
-      if (!tabInfo?.tabId) throw codedError("harvest_failed", "Failed to create ChatGPT tab");
-      const cdp = (expression) => options.cdpEvaluate(tabInfo.tabId, expression);
-      await options.cdpCommand(tabInfo.tabId, "Page.navigate", { url: job.conversationUrl });
-      await chatgptClient.assertUsablePage(cdp, request.signal);
-      return tabInfo.tabId;
+      // Uncoded on purpose: a tab that failed to appear is a browser problem,
+      // and the caller retries those.
+      if (!tabInfo?.tabId) throw new Error("Failed to create ChatGPT tab");
+      try {
+        const cdp = (expression) => options.cdpEvaluate(tabInfo.tabId, expression);
+        await options.cdpCommand(tabInfo.tabId, "Page.navigate", { url: job.conversationUrl });
+        await chatgptClient.assertUsablePage(cdp, request.signal);
+        return tabInfo.tabId;
+      } catch (error) {
+        // A tab that never became usable is not a recovery handle, it is
+        // litter. Retries are unbounded in wall time, so leaking one per
+        // attempt would bury the browser.
+        await closeTab(request, tabInfo.tabId).catch(() => {});
+        throw error;
+      }
     });
     oracleJobs.updateTabId(job.id, tabId);
     return tabId;
@@ -136,42 +161,61 @@ function createHarvestSupervisor({
     // whose last state change is already older than the staleness cutoff.
     oracleJobs.touchHarvest(jobId);
     let nextHeartbeatAt = Date.now() + HEARTBEAT_MS;
-    let tabId = await ensureConversationTab(job, request);
     const tracker = chatgptClient.createResponseTracker({
       baselineAssistant: job.baseline.latestAssistant,
       baselineAssistantCount: job.baseline.assistantCount,
     });
-    let retriedFreshTab = false;
+
+    let tabId = null;
+    let unreachableSince = null;
+    let reopens = 0;
 
     while (Date.now() < deadline) {
-      job = await captureConversationUrl(job, tabId, request);
-      let snapshot;
       try {
-        snapshot = await step(request, (options) =>
+        // Tab acquisition lives inside the retry loop: right after a host
+        // restart even listing tabs can time out, and that must not decide the
+        // fate of an answer ChatGPT is already writing.
+        if (tabId === null) tabId = await ensureConversationTab(job, request);
+        job = await captureConversationUrl(job, tabId, request);
+        const snapshot = await step(request, (options) =>
           chatgptClient.readChatGPTResponseSnapshot((expression) =>
             options.cdpEvaluate(tabId, expression),
           ),
         );
+        // One clean round trip retires the whole failure theory.
+        unreachableSince = null;
+
+        if (Date.now() >= nextHeartbeatAt) {
+          oracleJobs.touchHarvest(jobId);
+          nextHeartbeatAt = Date.now() + HEARTBEAT_MS;
+        }
+
+        const response = tracker.ingest(snapshot);
+        if (response) {
+          log(`[oracle:${jobId}:harvest] Response captured (${response.text.length} chars)`);
+          await completeJob(job, response, tabId, request);
+          return;
+        }
       } catch (error) {
-        // A tab that dies mid-generation is recoverable exactly once, and only
-        // through a durable conversation URL.
-        if (error?.code === "SURF_REQUEST_ABORTED" || retriedFreshTab || !job.conversationUrl) throw error;
-        log(`[oracle:${jobId}:harvest] Live tab failed (${error?.message || error}); reopening conversation`);
-        retriedFreshTab = true;
-        tabId = await ensureConversationTab({ ...job, tabId: null }, request);
+        if (error?.code === "SURF_REQUEST_ABORTED" || FATAL_CODES.has(error?.code)) throw error;
+        unreachableSince = unreachableSince ?? Date.now();
+        // Patience is measured in wall time, not attempts: a 30s extension
+        // timeout and an instant socket error must buy the same grace.
+        if (Date.now() - unreachableSince >= UNREACHABLE_PATIENCE_MS) throw error;
+        log(
+          `[oracle:${jobId}:harvest] Browser step failed (${error?.message || error}); retrying`,
+        );
+        // A failing tab is the likeliest cause, so reopen the conversation from
+        // its durable URL. Bounded, because if reopening is not helping either
+        // the browser is the problem and new tabs only add noise.
+        if (job.conversationUrl && reopens < MAX_REOPENS) {
+          log(`[oracle:${jobId}:harvest] Reopening conversation in a fresh tab`);
+          reopens++;
+          tabId = null;
+          job = { ...job, tabId: null };
+        }
+        await abortableDelay(failureRetryMs, request.signal);
         continue;
-      }
-
-      if (Date.now() >= nextHeartbeatAt) {
-        oracleJobs.touchHarvest(jobId);
-        nextHeartbeatAt = Date.now() + HEARTBEAT_MS;
-      }
-
-      const response = tracker.ingest(snapshot);
-      if (response) {
-        log(`[oracle:${jobId}:harvest] Response captured (${response.text.length} chars)`);
-        await completeJob(job, response, tabId, request);
-        return;
       }
       await abortableDelay(POLL_IDLE_MS, request.signal);
     }
@@ -278,4 +322,10 @@ function createHarvestSupervisor({
   };
 }
 
-module.exports = { createHarvestSupervisor, HARVEST_DEADLINE_MS, POLL_IDLE_MS };
+module.exports = {
+  createHarvestSupervisor,
+  HARVEST_DEADLINE_MS,
+  MAX_REOPENS,
+  POLL_IDLE_MS,
+  UNREACHABLE_PATIENCE_MS,
+};

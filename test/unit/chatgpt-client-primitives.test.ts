@@ -28,4 +28,36 @@ describe("chatgpt-client primitives", () => {
   ])("refuses the non-durable conversation id in %s", (input) => {
     expect(chatgptClient.extractConversationUrl(input)).toBeNull();
   });
+
+  // Live regression: the composer is ready long before a reopened conversation
+  // paints its turns, and a baseline taken in that window is empty — which
+  // silently disables message-id turn identity for the follow-up that needs it.
+  describe("waitForConversationTurns", () => {
+    const snapshotWith = (candidates: unknown[]) => ({
+      result: { value: { candidates, stopVisible: false } },
+    });
+
+    it("waits for turns to render before letting the caller snapshot", async () => {
+      const renders = [
+        snapshotWith([]),
+        snapshotWith([]),
+        snapshotWith([{ role: "assistant", isAssistant: true, text: "parent", messageId: "m1" }]),
+      ];
+      let call = 0;
+      const cdp = async () => renders[Math.min(call++, renders.length - 1)];
+
+      const snapshot = await chatgptClient.waitForConversationTurns(cdp, 5000);
+
+      expect(snapshot.candidates).toHaveLength(1);
+      expect(call).toBeGreaterThan(2);
+    });
+
+    it("refuses to continue with an empty conversation rather than guess", async () => {
+      const cdp = async () => snapshotWith([]);
+
+      await expect(chatgptClient.waitForConversationTurns(cdp, 300)).rejects.toMatchObject({
+        code: "baseline_unavailable",
+      });
+    });
+  });
 });

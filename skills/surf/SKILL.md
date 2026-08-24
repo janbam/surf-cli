@@ -108,13 +108,15 @@ surf oracle status <job-id> --json
 surf oracle result <job-id> --json
 # Or block until the answer is captured:
 surf oracle result <job-id> --wait --json
+# Bound a single wait (default 30s); the host keeps harvesting either way:
+surf oracle result <job-id> --timeout 5 --json
 # Give up on a job and free the capacity slot:
 surf oracle cancel <job-id> --json
 ```
 
 The native host harvests dispatched jobs on its own: after `ask` returns, a background watcher polls the conversation and writes `captured` or `failed` into the job record without any client attached. `status` reads that state without touching Chrome. `result` waits for the watcher to settle the job and returns the job object with `response`; if the answer is not ready within the wait window it returns the unfinished job, and harvesting continues regardless. A Ctrl-C during waiting exits with status 130 and prints `Recover with: surf oracle result <id>`.
 
-The host resumes watchers for non-terminal jobs on startup, so a native-host restart does not strand a job. Recovery after the dispatch tab is gone needs the durable conversation URL, which is recorded only once ChatGPT swaps its transient placeholder id for the server id; a job that never reached that point can still be harvested from its live tab but cannot be reopened later.
+The host resumes watchers for non-terminal jobs on startup, so a native-host restart does not strand a job. A resumed watcher tolerates a browser that is still warming up: extension timeouts are retried for several minutes before a job is given up on. Recovery after the dispatch tab is gone needs the durable conversation URL, which is recorded only once ChatGPT swaps its transient placeholder id for the server id; a job that never reached that point can still be harvested from its live tab but cannot be reopened later.
 
 Treat Pro quota as scarce. ChatGPT model aliases include `instant`, `thinking`, `pro`, `gpt-5.5`, and `gpt-5.6-sol`. Model and effort selection drives the current composer layout: one pill labeled `Instant`, `Medium`, or `High` opening Model/Effort submenus, so `instant`, `medium`, and `high` are the efforts that can be selected reliably; any other value (including `pro`) fails closed with `model_verification_failed`. Use `--model gpt-5.6-sol --effort high` for GPT-5.6 Sol with High effort on Plus accounts. Requested model and effort selections are read back before submission, and an unverifiable selection fails with `model_verification_failed` instead of silently continuing.
 

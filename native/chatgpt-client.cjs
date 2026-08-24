@@ -106,6 +106,32 @@ async function assertUsablePage(cdp, signal) {
   }
 }
 
+/**
+ * Wait until a reopened conversation has rendered its existing turns.
+ *
+ * `waitForPromptReady` only proves the composer exists, and the composer is
+ * live well before the transcript paints. A baseline taken in that window sees
+ * an empty conversation, which silently disables message-id turn identity for
+ * follow-ups — the answer the next dispatch captures could then be the parent's.
+ *
+ * Resolves as soon as any turn is present. Rejects on timeout rather than
+ * returning an empty baseline, because guessing here means answering the wrong
+ * question with the wrong answer.
+ */
+async function waitForConversationTurns(cdp, timeoutMs = 15000, signal) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    throwIfAborted(signal);
+    const snapshot = await readChatGPTResponseSnapshot(cdp);
+    if (snapshot?.candidates?.length > 0) return snapshot;
+    await delay(250, signal);
+  }
+  throw codedError(
+    "Conversation turns did not render; refusing to dispatch without a turn baseline",
+    "baseline_unavailable",
+  );
+}
+
 async function waitForConversationUrl(cdp, timeoutMs = 30000, signal) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -164,6 +190,12 @@ async function dispatch(options) {
       throw new Error("Prompt textarea not ready");
     }
     log("Prompt ready");
+    // Reopening an existing conversation: its turns must be on screen before
+    // anything snapshots them, or this dispatch has no identity to work from.
+    if (startUrl && extractConversationUrl(startUrl)) {
+      await waitForConversationTurns(cdp, 15000, signal);
+      log("Conversation turns rendered");
+    }
     let modelVerified = null;
     let effortVerified = null;
     if (model) {
@@ -222,6 +254,7 @@ async function dispatch(options) {
       "auth",
       "cloudflare",
       "model_verification_failed",
+      "baseline_unavailable",
     ]);
   }
 }
@@ -341,6 +374,7 @@ module.exports = {
   createResponseTracker,
   hasRequiredCookies,
   readChatGPTResponseSnapshot,
+  waitForConversationTurns,
   waitForConversationUrl,
   cleanChatGPTResponseText,
   extractLatestAssistantSnapshot,

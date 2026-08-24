@@ -9,3 +9,9 @@ dist/
 coverage/
 .playwright-mcp/
 FEATURE_COMPARISON.md
+
+# PlanAndTrack working plans
+.plans/
+
+# Live-test plans and session evidence: per-branch scratch, not repo content
+LIVE-TESTS-*.md

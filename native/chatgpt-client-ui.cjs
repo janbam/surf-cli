@@ -384,8 +384,10 @@ async function typePrompt(cdp, inputCdp, prompt, signal) {
         dispatchClickSequence(node);
         if (typeof node.focus === 'function') node.focus();
         // Select whatever the composer already holds so the inserted text
-        // replaces it. A failed dispatch leaves its prompt behind, and
-        // appending would submit a fused prompt the harvest can never match.
+        // replaces it, and never appends. Every dispatch opens a fresh tab, so
+        // this looks unreachable — it is not: ChatGPT restores unsent drafts
+        // into a new tab's composer, and a fused prompt would be submitted
+        // verbatim to the model.
         if ('value' in node) {
           node.select?.();
           return true;
