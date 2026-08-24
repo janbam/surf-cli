@@ -159,8 +159,18 @@ function isNewAssistantContent(
 
 function isChatGPTResponseComplete(snapshot, stableCycles, stableMs) {
   if (!snapshot?.text) return false;
+  // The action row belongs to the turn itself and only renders once that turn
+  // is done, which makes it the strongest completion signal available. The stop
+  // button is page-wide and ChatGPT sometimes leaves one behind after a turn
+  // settles — observed live as a 16 minute stall on a fully rendered answer.
+  if (snapshot.hasFinishedActions) {
+    if (!snapshot.stopVisible) return true;
+    // The two signals contradict each other. Believe the action row, but only
+    // after the text has stopped moving, so a turn that really is streaming is
+    // never cut off mid-sentence.
+    return stableCycles >= 4 && stableMs >= 1500;
+  }
   if (snapshot.stopVisible) return false;
-  if (snapshot.hasFinishedActions) return true;
   return stableCycles >= 6 && stableMs >= 1200;
 }
 
@@ -317,7 +327,16 @@ async function readChatGPTResponseSnapshot(cdp) {
 
       return {
         candidates,
-        stopVisible: Boolean(scope.querySelector(STOP_SELECTOR)),
+        // Visible and usable, not merely present: ChatGPT leaves stop buttons
+        // in the page, and a hidden or disabled one must not read as "still
+        // generating". Deliberately style-based rather than layout-based, so
+        // this means the same thing in a fixture as it does in Chrome.
+        stopVisible: Array.from(scope.querySelectorAll(STOP_SELECTOR)).some((node) => {
+          if (node.disabled || node.hidden) return false;
+          const style = node.ownerDocument?.defaultView?.getComputedStyle?.(node);
+          if (!style) return true;
+          return style.display !== 'none' && style.visibility !== 'hidden';
+        }),
       };
     })()`,
   );

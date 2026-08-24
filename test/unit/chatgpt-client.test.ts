@@ -531,14 +531,39 @@ describe("chatgpt-client", () => {
       ).toBe(false);
     });
 
-    it("returns false when stop button is still visible", () => {
+    it("returns false while the stop button is visible and the turn has no action row", () => {
       expect(
         chatgptClient.isChatGPTResponseComplete(
-          { text: "Answer", stopVisible: true, hasFinishedActions: true },
+          { text: "Answer", stopVisible: true, hasFinishedActions: false },
           6,
           1200,
         ),
       ).toBe(false);
+    });
+
+    // Observed live: a settled answer kept a page-wide stop button in the DOM
+    // and the job stalled in `awaiting` for 16 minutes. The turn's own action
+    // row is the authority, but only once the text has stopped moving.
+    describe("when the action row and the stop button contradict each other", () => {
+      it("waits while the text is still moving", () => {
+        expect(
+          chatgptClient.isChatGPTResponseComplete(
+            { text: "Answer", stopVisible: true, hasFinishedActions: true },
+            1,
+            400,
+          ),
+        ).toBe(false);
+      });
+
+      it("completes once the text has settled", () => {
+        expect(
+          chatgptClient.isChatGPTResponseComplete(
+            { text: "Answer", stopVisible: true, hasFinishedActions: true },
+            4,
+            1500,
+          ),
+        ).toBe(true);
+      });
     });
 
     it("returns true when finished actions are visible and stop is hidden", () => {
