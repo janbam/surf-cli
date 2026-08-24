@@ -200,7 +200,9 @@ async function dispatch(options) {
     // Gating here fails before any prompt is typed into the composer.
     const resumingConversation = Boolean(startUrl && extractConversationUrl(startUrl));
     if (resumingConversation) {
-      await waitForConversationTurns(cdp, 15000, signal);
+      // Same budget as the composer above: this gate is stricter, and failing it
+      // costs the whole follow-up.
+      await waitForConversationTurns(cdp, 30000, signal);
       log("Conversation turns rendered");
     }
     let modelVerified = null;
@@ -247,6 +249,13 @@ async function dispatch(options) {
         "Conversation baseline is empty; refusing to send a follow-up that could not be identified",
         "baseline_unavailable",
       );
+    }
+    // Without a message id, turn identity degrades to comparing text against
+    // the parent's answer. That still works, but it is the weak attribution
+    // this design replaced, so say it out loud rather than looking identical to
+    // a strongly identified dispatch.
+    if (baseline.latestAssistant && !baseline.latestAssistant.messageId) {
+      log("Baseline turn has no message id; identity falls back to text comparison");
     }
     if (beforeSubmit) await raceAbort(beforeSubmit, signal);
     await clickSend(cdp, inputCdp, signal);

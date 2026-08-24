@@ -127,7 +127,14 @@ function createHarvestSupervisor({
         throw error;
       }
     });
-    oracleJobs.updateTabId(job.id, tabId);
+    // Recording the tab is what makes it recoverable. If the record refuses the
+    // write, the tab is unreachable litter, not a handle.
+    try {
+      oracleJobs.updateTabId(job.id, tabId);
+    } catch (error) {
+      await closeTab(request, tabId).catch(() => {});
+      throw error;
+    }
     return tabId;
   }
 
