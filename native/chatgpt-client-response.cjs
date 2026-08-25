@@ -8,11 +8,6 @@ function normalizePromptEcho(prompt) {
     .slice(0, 200);
 }
 
-function matchesPromptEcho(text, promptEcho) {
-  const expected = normalizePromptEcho(promptEcho);
-  return expected.length > 0 && normalizePromptEcho(text) === expected;
-}
-
 function cleanChatGPTResponseText(rawText) {
   if (!rawText) return "";
 
@@ -65,6 +60,20 @@ function cleanChatGPTResponseText(rawText) {
   const trailingChromeCount = lines.length - trailingChromeStart;
   if (trailingChromeCount >= 2) {
     lines.splice(trailingChromeStart);
+  }
+
+  // Some layouts render the action row above the message body, so the same
+  // chrome vocabulary leaks in at the head ("Edit" prefixed live answers).
+  // A single line is enough to strip here: unlike the trailing row, a real
+  // answer does not open with a bare one-word action label.
+  let leadingChromeEnd = 0;
+  while (leadingChromeEnd < lines.length && lines[leadingChromeEnd].isChrome) {
+    leadingChromeEnd++;
+  }
+  // Unless that is all there is: a reply consisting solely of "Copy" is a real
+  // answer, and erasing it would be worse than leaving a label in.
+  if (leadingChromeEnd > 0 && leadingChromeEnd < lines.length) {
+    lines.splice(0, leadingChromeEnd);
   }
 
   while (lines.length > 0 && lines[0].trimmed.length === 0) {
@@ -123,12 +132,13 @@ function isNewAssistantContent(
 ) {
   if (!latestAssistant) return false;
   if (!baselineAssistant) return true;
-  if (
-    latestAssistant.messageId &&
-    baselineAssistant.messageId &&
-    latestAssistant.messageId !== baselineAssistant.messageId
-  ) {
-    return true;
+  // Message ids are the strongest identity signal available: when both turns
+  // carry one, it decides the question outright. Falling through to the text
+  // and index heuristics below would let a re-rendered baseline turn (a late
+  // reasoning preamble, or a different turn count in a reopened tab) be
+  // reported as this dispatch's answer.
+  if (latestAssistant.messageId && baselineAssistant.messageId) {
+    return latestAssistant.messageId !== baselineAssistant.messageId;
   }
 
   const currentText = latestAssistant.text || "";
@@ -149,28 +159,79 @@ function isNewAssistantContent(
 
 function isChatGPTResponseComplete(snapshot, stableCycles, stableMs) {
   if (!snapshot?.text) return false;
+  // The action row belongs to the turn itself and only renders once that turn
+  // is done, which makes it the strongest completion signal available. The stop
+  // button is page-wide and ChatGPT sometimes leaves one behind after a turn
+  // settles — observed live as a 16 minute stall on a fully rendered answer.
+  if (snapshot.hasFinishedActions) {
+    if (!snapshot.stopVisible) return true;
+    // The two signals contradict each other. Believe the action row, but only
+    // after the text has stopped moving, so a turn that really is streaming is
+    // never cut off mid-sentence.
+    return stableCycles >= 4 && stableMs >= 1500;
+  }
   if (snapshot.stopVisible) return false;
-  if (snapshot.hasFinishedActions) return true;
   return stableCycles >= 6 && stableMs >= 1200;
 }
 
-function scopeSnapshotToPrompt(rawSnapshot, promptEcho) {
-  const candidates = Array.isArray(rawSnapshot?.candidates) ? rawSnapshot.candidates : [];
-  let userIndex = -1;
-  for (let index = candidates.length - 1; index >= 0; index--) {
-    const candidate = candidates[index];
-    if (candidate?.isUser && matchesPromptEcho(candidate.text, promptEcho)) {
-      userIndex = index;
-      break;
-    }
-  }
-  if (userIndex === -1) return { ...rawSnapshot, candidates: [] };
+/**
+ * Track assistant output across DOM snapshots and decide when the answer that
+ * belongs to one dispatch is finished.
+ *
+ * Identity comes from the pre-send baseline, not from the prompt text: any
+ * assistant content differing from the baseline turn (by message id, turn
+ * index, or text) is ours. The tracker owns the stability counters, so callers
+ * may poll at any cadence — including through a shared request queue.
+ *
+ * `ingest` returns the finished response once, or null while still waiting.
+ */
+function createResponseTracker({ baselineAssistant = null, baselineAssistantCount = 0 } = {}) {
+  let previousText = baselineAssistant?.text || "";
+  let stableCycles = 0;
+  let lastChangeAt = Date.now();
 
-  const following = candidates.slice(userIndex + 1);
-  const nextUserIndex = following.findIndex((candidate) => candidate?.isUser);
   return {
-    ...rawSnapshot,
-    candidates: nextUserIndex === -1 ? following : following.slice(0, nextUserIndex),
+    ingest(rawSnapshot) {
+      if (!rawSnapshot) return null;
+      const { latestAssistant, assistantCount, stopVisible } = normalizeResponseSnapshot(rawSnapshot);
+      // Ignore everything that is still the pre-send state of the conversation.
+      if (
+        !isNewAssistantContent(
+          latestAssistant,
+          baselineAssistant,
+          assistantCount,
+          baselineAssistantCount,
+        )
+      ) {
+        return null;
+      }
+
+      // Streaming text keeps resetting the stability window; only a settled
+      // turn may be treated as complete.
+      const currentText = latestAssistant?.text || "";
+      if (currentText !== previousText) {
+        previousText = currentText;
+        stableCycles = 0;
+        lastChangeAt = Date.now();
+      } else if (currentText) {
+        stableCycles++;
+      } else {
+        stableCycles = 0;
+        lastChangeAt = Date.now();
+      }
+
+      const completionSnapshot = latestAssistant
+        ? { ...latestAssistant, stopVisible }
+        : { text: "", stopVisible, hasFinishedActions: false };
+      if (!isChatGPTResponseComplete(completionSnapshot, stableCycles, Date.now() - lastChangeAt)) {
+        return null;
+      }
+      return {
+        text: latestAssistant.text,
+        messageId: latestAssistant.messageId,
+        turnIndex: latestAssistant.turnIndex,
+      };
+    },
   };
 }
 
@@ -193,6 +254,20 @@ async function readChatGPTResponseSnapshot(cdp) {
           ? turnNode
           : turnNode.querySelector('[data-message-author-role], [data-turn]');
         const searchRoot = resolvedMessageRoot || authorRoot || turnNode;
+        // The durable message id and the author role live on an inner node; the
+        // turn wrapper only carries data-turn. Resolving identity from the
+        // wrapper leaves every turn anonymous, which silently demotes
+        // attribution to comparing rendered text.
+        const turnHint = turnNode.getAttribute?.('data-turn') || null;
+        const idNodes = [
+          ...(searchRoot.matches?.('[data-message-id]') ? [searchRoot] : []),
+          ...Array.from(searchRoot.querySelectorAll?.('[data-message-id]') || []),
+          ...Array.from(turnNode.querySelectorAll?.('[data-message-id]') || []),
+        ];
+        const identityRoot =
+          idNodes.find((node) => !turnHint || node.getAttribute('data-message-author-role') === turnHint) ||
+          idNodes[0] ||
+          null;
         let contentRoot = null;
 
         for (const selector of CONTENT_SELECTORS) {
@@ -206,6 +281,7 @@ async function readChatGPTResponseSnapshot(cdp) {
         }
 
         const role =
+          identityRoot?.getAttribute('data-message-author-role') ||
           resolvedMessageRoot?.getAttribute('data-message-author-role') ||
           authorRoot?.getAttribute('data-message-author-role') ||
           turnNode.getAttribute('data-message-author-role') ||
@@ -222,6 +298,7 @@ async function readChatGPTResponseSnapshot(cdp) {
         const isUser = role === 'user' || turn === 'user';
         const text = (contentRoot || turnNode).innerText || (contentRoot || turnNode).textContent || '';
         const messageId =
+          identityRoot?.getAttribute('data-message-id') ||
           resolvedMessageRoot?.getAttribute('data-message-id') ||
           turnNode.getAttribute('data-message-id') ||
           null;
@@ -250,73 +327,41 @@ async function readChatGPTResponseSnapshot(cdp) {
 
       return {
         candidates,
-        stopVisible: Boolean(scope.querySelector(STOP_SELECTOR)),
+        // Visible and usable, not merely present: ChatGPT leaves stop buttons
+        // in the page, and a hidden or disabled one must not read as "still
+        // generating". Deliberately style-based rather than layout-based, so
+        // this means the same thing in a fixture as it does in Chrome.
+        stopVisible: Array.from(scope.querySelectorAll(STOP_SELECTOR)).some((node) => {
+          if (node.disabled || node.hidden) return false;
+          const style = node.ownerDocument?.defaultView?.getComputedStyle?.(node);
+          if (!style) return true;
+          return style.display !== 'none' && style.visibility !== 'hidden';
+        }),
       };
     })()`,
   );
 }
 
+/**
+ * Poll one tab until the dispatch identified by `baselineAssistant` finishes.
+ *
+ * Used by the direct (non-oracle) ChatGPT path, which owns its tab for the
+ * whole wait. The oracle drives the same tracker from its own queued poll loop.
+ */
 async function waitForResponse(
   cdp,
   timeoutMs = 2700000,
   baselineAssistant,
   baselineAssistantCount,
   signal,
-  promptEcho,
 ) {
   throwIfAborted(signal);
   const deadline = Date.now() + timeoutMs;
-  let previousText = baselineAssistant?.text || "";
-  let stableCycles = 0;
-  let lastChangeAt = Date.now();
+  const tracker = createResponseTracker({ baselineAssistant, baselineAssistantCount });
 
   while (Date.now() < deadline) {
-    const rawSnapshot = await readChatGPTResponseSnapshot(cdp);
-    const snapshot = promptEcho ? scopeSnapshotToPrompt(rawSnapshot, promptEcho) : rawSnapshot;
-
-    if (!snapshot) {
-      await delay(400, signal);
-      continue;
-    }
-
-    const { latestAssistant, assistantCount, stopVisible } = normalizeResponseSnapshot(snapshot);
-    const currentText = latestAssistant?.text || "";
-    const hasNewAssistantContent = isNewAssistantContent(
-      latestAssistant,
-      baselineAssistant,
-      assistantCount,
-      baselineAssistantCount,
-    );
-
-    if (!hasNewAssistantContent) {
-      await delay(400, signal);
-      continue;
-    }
-
-    if (currentText !== previousText) {
-      previousText = currentText;
-      stableCycles = 0;
-      lastChangeAt = Date.now();
-    } else if (currentText) {
-      stableCycles++;
-    } else {
-      stableCycles = 0;
-      lastChangeAt = Date.now();
-    }
-
-    const stableMs = Date.now() - lastChangeAt;
-    const completionSnapshot = latestAssistant
-      ? { ...latestAssistant, stopVisible }
-      : { text: "", stopVisible, hasFinishedActions: false };
-
-    if (isChatGPTResponseComplete(completionSnapshot, stableCycles, stableMs)) {
-      return {
-        text: latestAssistant.text,
-        messageId: latestAssistant.messageId,
-        turnIndex: latestAssistant.turnIndex,
-      };
-    }
-
+    const response = tracker.ingest(await readChatGPTResponseSnapshot(cdp));
+    if (response) return response;
     await delay(400, signal);
   }
 
@@ -325,10 +370,10 @@ async function waitForResponse(
 
 module.exports = {
   cleanChatGPTResponseText,
+  createResponseTracker,
   extractLatestAssistantSnapshot,
   isChatGPTResponseComplete,
   isNewAssistantContent,
-  matchesPromptEcho,
   normalizePromptEcho,
   normalizeResponseSnapshot,
   readChatGPTResponseSnapshot,

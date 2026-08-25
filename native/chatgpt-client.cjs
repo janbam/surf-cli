@@ -20,10 +20,10 @@ const {
 } = require("./chatgpt-client-ui.cjs");
 const {
   cleanChatGPTResponseText,
+  createResponseTracker,
   extractLatestAssistantSnapshot,
   isChatGPTResponseComplete,
   isNewAssistantContent,
-  matchesPromptEcho,
   normalizePromptEcho,
   normalizeResponseSnapshot,
   readChatGPTResponseSnapshot,
@@ -31,7 +31,11 @@ const {
 } = require("./chatgpt-client-response.cjs");
 
 const CHATGPT_URL = "https://chatgpt.com/";
-const RESPONSE_STARTED_AT = Symbol("responseStartedAt");
+
+// ChatGPT routes optimistically to a client-side placeholder id ("WEB:<uuid>")
+// and only later swaps in the server id. Only the server id survives a reload,
+// so anything else must be treated as "not durable yet" instead of recorded.
+const DURABLE_CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function hasRequiredCookies(cookies) {
   if (!cookies || !Array.isArray(cookies)) return false;
@@ -44,11 +48,18 @@ function hasRequiredCookies(cookies) {
   );
 }
 
+/**
+ * Extract a durable ChatGPT conversation URL from a browser location.
+ *
+ * Returns null for anything that cannot be navigated back to later, including
+ * the transient placeholder ids ChatGPT shows before the server id arrives.
+ */
 function extractConversationUrl(value) {
   try {
     const url = new URL(String(value));
     const match = url.pathname.match(/^\/c\/([^/]+)\/?$/);
     if (url.protocol !== "https:" || url.hostname !== "chatgpt.com" || !match) return null;
+    if (!DURABLE_CONVERSATION_ID.test(match[1])) return null;
     return `${url.origin}/c/${match[1]}`;
   } catch {
     return null;
@@ -70,6 +81,60 @@ function classifyError(error, fallbackCode, preservedCodes = []) {
     classified.code = fallbackCode;
   }
   return classified;
+}
+
+/**
+ * Fail fast on the two page states that make every later step meaningless:
+ * a Cloudflare interstitial and a logged-out session.
+ */
+async function assertUsablePage(cdp, signal) {
+  await waitForPageLoad(cdp, 45000, signal);
+  if (await isCloudflareBlocked(cdp)) {
+    throw codedError("Cloudflare challenge detected - complete in browser", "cloudflare");
+  }
+  const loginStatus = await checkLoginStatus(cdp);
+  // Status 0 means the probe itself never completed — navigation still
+  // settling, a service worker restarting, a blip. That says nothing about the
+  // session, so it stays uncoded and callers may retry it. Coding it `auth`
+  // would make a transient hiccup permanently fatal for a harvest.
+  if (loginStatus.status === 0) {
+    throw new Error(
+      loginStatus.error
+        ? `ChatGPT login check did not complete: ${loginStatus.error}`
+        : "ChatGPT login check did not complete",
+    );
+  }
+  if (loginStatus.status !== 200 || loginStatus.hasLoginCta) {
+    throw codedError("ChatGPT login required", "auth");
+  }
+}
+
+/**
+ * Wait until a reopened conversation has rendered its existing turns.
+ *
+ * `waitForPromptReady` only proves the composer exists, and the composer is
+ * live well before the transcript paints. A baseline taken in that window sees
+ * an empty conversation, which silently disables message-id turn identity for
+ * follow-ups — the answer the next dispatch captures could then be the parent's.
+ *
+ * Resolves as soon as any turn is present. Rejects on timeout rather than
+ * returning an empty baseline, because guessing here means answering the wrong
+ * question with the wrong answer.
+ */
+async function waitForConversationTurns(cdp, timeoutMs = 15000, signal) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    throwIfAborted(signal);
+    const snapshot = await readChatGPTResponseSnapshot(cdp);
+    // User turns paint first, and a transcript showing only those still yields
+    // an empty baseline. The assistant turn is the one identity depends on.
+    if (normalizeResponseSnapshot(snapshot).latestAssistant) return snapshot;
+    await delay(250, signal);
+  }
+  throw codedError(
+    "Conversation turns did not render; refusing to dispatch without a turn baseline",
+    "baseline_unavailable",
+  );
 }
 
 async function waitForConversationUrl(cdp, timeoutMs = 30000, signal) {
@@ -123,29 +188,23 @@ async function dispatch(options) {
       raceAbort(() => cdpCommand(tabId, method, params), signal);
 
     if (startUrl) await inputCdp("Page.navigate", { url: startUrl });
-    await waitForPageLoad(cdp, 45000, signal);
-    log("Page loaded");
-    if (await isCloudflareBlocked(cdp)) {
-      throw codedError("Cloudflare challenge detected - complete in browser", "cloudflare");
-    }
-    const loginStatus = await checkLoginStatus(cdp);
-    if (loginStatus.status === 0) {
-      throw codedError(
-        loginStatus.error
-          ? `ChatGPT login check failed: ${loginStatus.error}`
-          : "ChatGPT login check failed",
-        "auth",
-      );
-    }
-    if (loginStatus.status !== 200 || loginStatus.hasLoginCta) {
-      throw codedError("ChatGPT login required", "auth");
-    }
-    log("Login verified");
+    await assertUsablePage(cdp, signal);
+    log("Page loaded, login verified");
     const promptReady = await waitForPromptReady(cdp, 30000, signal);
     if (!promptReady) {
       throw new Error("Prompt textarea not ready");
     }
     log("Prompt ready");
+    // Reopening an existing conversation: its turns must be on screen before
+    // anything snapshots them, or this dispatch has no identity to work from.
+    // Gating here fails before any prompt is typed into the composer.
+    const resumingConversation = Boolean(startUrl && extractConversationUrl(startUrl));
+    if (resumingConversation) {
+      // Same budget as the composer above: this gate is stricter, and failing it
+      // costs the whole follow-up.
+      await waitForConversationTurns(cdp, 30000, signal);
+      log("Conversation turns rendered");
+    }
     let modelVerified = null;
     let effortVerified = null;
     if (model) {
@@ -177,13 +236,32 @@ async function dispatch(options) {
       effortVerified = await selectEffort(cdp, effort, 8000, signal);
       log(`Verified effort: ${effortVerified}`);
     }
+    // Snapshot the conversation before sending: this baseline is what later
+    // identifies our answer by turn identity, so it must be recorded durably
+    // by the caller before the response can arrive.
     const baseline = normalizeResponseSnapshot(await readChatGPTResponseSnapshot(cdp));
+    // The gate above ran before model selection and typing; this is the
+    // snapshot that actually becomes the baseline, so it is the one that has to
+    // hold. Sending into a conversation we cannot identify turns in would make
+    // the parent's answer a plausible capture for this job.
+    if (resumingConversation && !baseline.latestAssistant) {
+      throw codedError(
+        "Conversation baseline is empty; refusing to send a follow-up that could not be identified",
+        "baseline_unavailable",
+      );
+    }
+    // Without a message id, turn identity degrades to comparing text against
+    // the parent's answer. That still works, but it is the weak attribution
+    // this design replaced, so say it out loud rather than looking identical to
+    // a strongly identified dispatch.
+    if (baseline.latestAssistant && !baseline.latestAssistant.messageId) {
+      log("Baseline turn has no message id; identity falls back to text comparison");
+    }
     if (beforeSubmit) await raceAbort(beforeSubmit, signal);
     await clickSend(cdp, inputCdp, signal);
-    baseline[RESPONSE_STARTED_AT] = Date.now();
     const promptEcho = normalizePromptEcho(prompt);
     if (afterSubmit) {
-      await afterSubmit({ tabId, promptEcho, modelVerified, effortVerified });
+      await afterSubmit({ tabId, promptEcho, modelVerified, effortVerified, baseline });
     }
     log("Prompt sent, waiting for response...");
     const conversationUrl = await waitForConversationUrl(cdp, 30000, signal);
@@ -202,6 +280,7 @@ async function dispatch(options) {
       "auth",
       "cloudflare",
       "model_verification_failed",
+      "baseline_unavailable",
     ]);
   }
 }
@@ -210,7 +289,6 @@ async function harvest(options) {
   const {
     tabId: liveTabId,
     conversationUrl,
-    promptEcho,
     baseline,
     timeout = 2700000,
     createTab,
@@ -245,34 +323,15 @@ async function harvest(options) {
 
     if (ownsTab) {
       await inputCdp("Page.navigate", { url: conversationUrl });
-      await waitForPageLoad(cdp, 45000, signal);
-      if (await isCloudflareBlocked(cdp)) {
-        throw codedError("Cloudflare challenge detected - complete in browser", "cloudflare");
-      }
-      const loginStatus = await checkLoginStatus(cdp);
-      if (loginStatus.status === 0) {
-        throw codedError(
-          loginStatus.error
-            ? `ChatGPT login check failed: ${loginStatus.error}`
-            : "ChatGPT login check failed",
-          "auth",
-        );
-      }
-      if (loginStatus.status !== 200 || loginStatus.hasLoginCta) {
-        throw codedError("ChatGPT login required", "auth");
-      }
+      await assertUsablePage(cdp, signal);
     }
 
-    const elapsedSinceSend = baseline?.[RESPONSE_STARTED_AT]
-      ? Date.now() - baseline[RESPONSE_STARTED_AT]
-      : 0;
     const response = await waitForResponse(
       cdp,
-      Math.max(0, timeout - elapsedSinceSend),
+      timeout,
       baseline?.latestAssistant,
       baseline?.assistantCount,
       signal,
-      baseline ? undefined : promptEcho,
     );
     log(`Response received (${response.text.length} chars)`);
     return {
@@ -313,7 +372,6 @@ async function query(options) {
       ...options,
       tabId: dispatched.tabId,
       conversationUrl: dispatched.conversationUrl,
-      promptEcho: dispatched.promptEcho,
       baseline: dispatched.baseline,
       timeout,
     });
@@ -338,7 +396,12 @@ module.exports = {
   query,
   dispatch,
   harvest,
+  assertUsablePage,
+  createResponseTracker,
   hasRequiredCookies,
+  readChatGPTResponseSnapshot,
+  waitForConversationTurns,
+  waitForConversationUrl,
   cleanChatGPTResponseText,
   extractLatestAssistantSnapshot,
   normalizeChatGPTEffortChoice,
@@ -349,7 +412,7 @@ module.exports = {
   isChatGPTResponseComplete,
   isCloudflareBlocked,
   normalizePromptEcho,
-  matchesPromptEcho,
+  normalizeResponseSnapshot,
   extractConversationUrl,
   verifyChatGPTEffortSelection,
   verifyChatGPTModelSelection,

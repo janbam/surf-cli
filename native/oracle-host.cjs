@@ -1,4 +1,5 @@
 const chatgptClient = require("./chatgpt-client.cjs");
+const { createHarvestSupervisor } = require("./oracle-harvest.cjs");
 const oracleJobs = require("./oracle-jobs.cjs");
 
 const TERMINAL_STATES = new Set(["captured", "failed"]);
@@ -23,7 +24,21 @@ function withJobId(error, jobId, fallbackCode) {
   return result;
 }
 
-function createOracleHost({ queueAiRequest, requestCallExtension, buildProviderUploadMessage, log }) {
+/**
+ * Oracle tool surface: creates jobs, dispatches them into ChatGPT, and reads
+ * back state that the harvest supervisor produces on its own.
+ *
+ * `createBackgroundRequest(label)` must return a request context that outlives
+ * the client request which created the job; the supervisor uses it to keep
+ * talking to the browser after `oracle.ask` has already answered.
+ */
+function createOracleHost({
+  queueAiRequest,
+  requestCallExtension,
+  createBackgroundRequest,
+  buildProviderUploadMessage,
+  log,
+}) {
   const closeTab = (request, tabId) => requestCallExtension(
     request,
     "close_tab",
@@ -62,6 +77,25 @@ function createOracleHost({ queueAiRequest, requestCallExtension, buildProviderU
     ),
   });
 
+  const listTabs = async (request) => {
+    const result = await requestCallExtension(request, "list_tabs", { type: "LIST_TABS" });
+    if (result?.error) throw new Error(result.error);
+    return result?.tabs;
+  };
+
+  const supervisor = createHarvestSupervisor({
+    queueAiRequest,
+    createBackgroundRequest,
+    browserOptions,
+    closeTab,
+    listTabs,
+    log,
+  });
+  // Jobs whose dispatch is still running in this process. A `created` record is
+  // otherwise indistinguishable from one whose dispatch died, and only this set
+  // can tell the two apart.
+  const dispatching = new Set();
+
   async function ask(request, args) {
     assertLocalOracleRequest(request);
     const model = args.model ? chatgptClient.normalizeChatGPTModelChoice(args.model) : null;
@@ -75,6 +109,7 @@ function createOracleHost({ queueAiRequest, requestCallExtension, buildProviderU
     });
     if (created.requestDeduped) return oracleJobs.getJob(created.id);
     let createdTabId = null;
+    dispatching.add(created.id);
 
     try {
       let parent = null;
@@ -100,12 +135,13 @@ function createOracleHost({ queueAiRequest, requestCallExtension, buildProviderU
           createdTabId = tabInfo?.tabId || null;
           return tabInfo;
         },
-        afterSubmit: ({ tabId, promptEcho, modelVerified, effortVerified }) => {
+        afterSubmit: ({ tabId, promptEcho, modelVerified, effortVerified, baseline }) => {
           const dispatchedJob = oracleJobs.markDispatched(created.id, {
             tabId,
             promptEcho,
             modelVerified,
             effortVerified,
+            baseline,
           });
           if (parent) {
             oracleJobs.appendTurn(parent.id, {
@@ -125,25 +161,41 @@ function createOracleHost({ queueAiRequest, requestCallExtension, buildProviderU
           promptEcho: dispatched.promptEcho,
         });
       }
+      // Harvesting belongs to the host from here on: the answer is captured
+      // even if this client never asks for it again.
+      supervisor.watch(created.id);
       return oracleJobs.getJob(created.id);
     } catch (error) {
       const current = oracleJobs.getJob(created.id);
+      // Once the job leaves `created` the prompt is already in ChatGPT. Hand it
+      // to the supervisor and report the failure as recoverable instead of
+      // discarding an answer that is on its way. This holds for aborts too: a
+      // client disconnect or request deadline says nothing about the answer
+      // ChatGPT is already writing, and `oracle cancel` is the way to drop it.
+      if (current.state === "dispatched" || current.state === "awaiting") {
+        supervisor.watch(created.id);
+        const recoverable = withJobId(error, created.id, "dispatch_failed");
+        recoverable.recoverable = true;
+        throw recoverable;
+      }
+      // Either nothing reached ChatGPT, or the record was retired underneath
+      // this dispatch (a concurrent cancel). Record why, unless the client
+      // aborted or the job already ended.
       if (error?.code !== "SURF_REQUEST_ABORTED" && !TERMINAL_STATES.has(current.state)) {
         oracleJobs.markFailed(created.id, {
           code: error?.code || "dispatch_failed",
           message: error?.message || String(error),
         });
       }
-      const keepForManualClearance = ["auth", "cloudflare"].includes(error?.code)
-        && current.state === "created";
-      if (
-        createdTabId
-        && !keepForManualClearance
-        && (error?.code !== "SURF_REQUEST_ABORTED" || current.state === "created")
-      ) {
+      // Login and Cloudflare walls need a human in that tab; everything else
+      // leaves nothing worth keeping open.
+      const keepForManualClearance = ["auth", "cloudflare"].includes(error?.code);
+      if (createdTabId && !keepForManualClearance) {
         await closeTab(request, createdTabId).catch(() => {});
       }
       throw withJobId(error, created.id, "dispatch_failed");
+    } finally {
+      dispatching.delete(created.id);
     }
   }
 
@@ -160,9 +212,39 @@ function createOracleHost({ queueAiRequest, requestCallExtension, buildProviderU
     return oracleJobs.listJobs({});
   }
 
+  /**
+   * Read a job's outcome, waiting for the supervisor if it is still working.
+   *
+   * This never harvests itself: the supervisor owns the browser loop, so a
+   * client that gives up costs nothing and a client that keeps polling sees the
+   * result within one poll cycle of the answer settling.
+   */
   async function result(request, args) {
     assertLocalOracleRequest(request);
     let job = oracleJobs.getJob(args.id);
+    // A `created` job is only alive while its own dispatch is running. Once
+    // that is gone nothing can ever advance it, so retire it loudly instead of
+    // handing the caller a job it would poll forever.
+    if (job.state === "created") {
+      if (dispatching.has(job.id)) return job;
+      oracleJobs.markFailed(job.id, {
+        code: "dispatch_failed",
+        message: `oracle job ${job.id} was never dispatched; its prompt never reached ChatGPT`,
+      });
+      throw codedError("dispatch_failed", `oracle job ${job.id} was never dispatched`, {
+        jobId: job.id,
+      });
+    }
+    if (!TERMINAL_STATES.has(job.state)) {
+      // Adopt jobs whose watcher never started or died with the previous host.
+      supervisor.watch(job.id);
+      const requestedTimeout = Number(args.timeout);
+      const timeout = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+        ? requestedTimeout * 1000
+        : 300000;
+      await supervisor.wait(job.id, timeout);
+      job = oracleJobs.getJob(job.id);
+    }
     if (job.state === "captured") {
       return { ...job, response: oracleJobs.getResponse(job.id) };
     }
@@ -171,133 +253,40 @@ function createOracleHost({ queueAiRequest, requestCallExtension, buildProviderU
         jobId: job.id,
       });
     }
+    return job;
+  }
 
-    const requestedTimeout = Number(args.timeout);
-    const timeout = Number.isFinite(requestedTimeout) && requestedTimeout > 0
-      ? requestedTimeout * 1000
-      : 300000;
-
-    try {
-      const harvested = await queueAiRequest(async () => {
-        job = oracleJobs.getJob(job.id);
-        const tabsResult = await requestCallExtension(request, "list_tabs", { type: "LIST_TABS" });
-        if (tabsResult?.error) throw new Error(tabsResult.error);
-        const liveTab = Array.isArray(tabsResult?.tabs)
-          && tabsResult.tabs.some((tab) => tab?.id === job.tabId);
-        if (!liveTab && !job.conversationUrl) {
-          throw codedError(
-            "harvest_failed",
-            `oracle job ${job.id} tab is no longer available; the response may still exist in ChatGPT web history but cannot be recovered without a conversation URL`,
-          );
-        }
-
-        const options = browserOptions(request);
-        const readConversationUrl = async (tabId) => {
-          const href = await options.cdpEvaluate(tabId, "location.href");
-          return chatgptClient.extractConversationUrl(href?.result?.value);
-        };
-        if (liveTab && !job.conversationUrl) {
-          const conversationUrl = await readConversationUrl(job.tabId);
-          if (conversationUrl) {
-            job = oracleJobs.markAwaiting(job.id, {
-              conversationUrl,
-              promptEcho: job.promptEcho,
-            });
-          }
-        }
-        const harvestOptions = {
-          ...options,
-          conversationUrl: job.conversationUrl,
-          promptEcho: job.promptEcho,
-          timeout,
-          keepCreatedTabOpen: true,
-          createTab: async () => {
-            const tabInfo = await options.createTab();
-            if (tabInfo?.tabId) oracleJobs.updateTabId(job.id, tabInfo.tabId);
-            return tabInfo;
-          },
-          log: (message) => log(`[oracle:${job.id}:harvest] ${message}`),
-        };
-        let harvestResult;
-        if (liveTab) {
-          try {
-            harvestResult = await chatgptClient.harvest({
-              ...harvestOptions,
-              tabId: job.tabId,
-            });
-          } catch (error) {
-            if (error?.code === "timeout" || error?.code === "SURF_REQUEST_ABORTED") throw error;
-            job = oracleJobs.getJob(job.id);
-            if (!job.conversationUrl) throw error;
-            log(`[oracle:${job.id}:harvest] Live-tab harvest failed; retrying via conversation URL`);
-            harvestResult = await chatgptClient.harvest({
-              ...harvestOptions,
-              tabId: null,
-              conversationUrl: job.conversationUrl,
-            });
-          }
-        } else {
-          harvestResult = await chatgptClient.harvest({
-            ...harvestOptions,
-            tabId: null,
-          });
-        }
-
-        job = oracleJobs.getJob(job.id);
-        if (job.state === "dispatched" && job.tabId) {
-          const conversationUrl = await readConversationUrl(job.tabId);
-          if (!conversationUrl) {
-            throw codedError("harvest_failed", `oracle job ${job.id} conversation URL is unavailable`);
-          }
-          oracleJobs.markAwaiting(job.id, {
-            conversationUrl,
-            promptEcho: job.promptEcho,
-          });
-        }
-        return harvestResult;
-      }, request);
-
-      job = oracleJobs.getJob(job.id);
-      const captured = oracleJobs.markCaptured(job.id, harvested);
-      if (captured.follow) {
-        oracleJobs.markTurnCaptured(captured.follow, {
-          dispatchedAt: captured.dispatchedAt,
-          capturedAt: captured.capturedAt,
-          childJobId: captured.id,
-          requestId: captured.requestId ?? null,
-        });
-      }
-      if (captured.tabId) {
-        await closeTab(request, captured.tabId).catch((error) => {
-          log(`[oracle:${captured.id}] Failed to close tab ${captured.tabId}: ${error?.message || error}`);
-        });
-      }
-      return { ...captured, response: harvested.response };
-    } catch (error) {
-      if (error?.code === "timeout") return oracleJobs.getJob(job.id);
-      if (error?.code === "SURF_REQUEST_ABORTED") {
-        throw withJobId(error, job.id, "harvest_failed");
-      }
-      const current = oracleJobs.getJob(job.id);
-      if (!TERMINAL_STATES.has(current.state)) {
-        oracleJobs.markFailed(current.id, {
-          code: error?.code || "harvest_failed",
-          message: error?.message || String(error),
-        });
-      }
-      if (current.tabId) await closeTab(request, current.tabId).catch(() => {});
-      throw withJobId(error, current.id, "harvest_failed");
+  /**
+   * Abandon a job on purpose: stop its watcher, record the cancellation, and
+   * release both the tab and the single-job capacity slot.
+   */
+  async function cancel(request, args) {
+    assertLocalOracleRequest(request);
+    const job = oracleJobs.getJob(args.id);
+    if (TERMINAL_STATES.has(job.state)) return job;
+    supervisor.cancel(job.id);
+    const cancelled = oracleJobs.markFailed(job.id, {
+      code: "cancelled",
+      message: `oracle job ${job.id} was cancelled`,
+    });
+    if (job.tabId !== null && job.tabId !== undefined) {
+      await closeTab(request, job.tabId).catch(() => {});
     }
+    return cancelled;
   }
 
   return {
-    adoptOrphans: oracleJobs.adoptOrphans,
     ask,
     assertLocal: assertLocalOracleRequest,
+    /** Restart watchers for jobs the previous host process left behind. */
+    resumeHarvest: () => supervisor.resume(),
+    /** Abort every watcher without touching job records. */
+    stopHarvest: () => supervisor.stop(),
     handle(request, message) {
       if (message.type === "ORACLE_ASK") return ask(request, message);
       if (message.type === "ORACLE_STATUS") return status(request, message);
       if (message.type === "ORACLE_RESULT") return result(request, message);
+      if (message.type === "ORACLE_CANCEL") return cancel(request, message);
       if (message.type === "ORACLE_LIST") return list(request);
       throw new Error(`Unknown oracle request: ${message.type}`);
     },

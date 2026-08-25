@@ -383,12 +383,20 @@ async function typePrompt(cdp, inputCdp, prompt, signal) {
         if (!node) continue;
         dispatchClickSequence(node);
         if (typeof node.focus === 'function') node.focus();
+        // Select whatever the composer already holds so the inserted text
+        // replaces it, and never appends. Every dispatch opens a fresh tab, so
+        // this looks unreachable — it is not: ChatGPT restores unsent drafts
+        // into a new tab's composer, and a fused prompt would be submitted
+        // verbatim to the model.
+        if ('value' in node) {
+          node.select?.();
+          return true;
+        }
         const doc = node.ownerDocument;
         const selection = doc?.getSelection?.();
         if (selection) {
           const range = doc.createRange();
           range.selectNodeContents(node);
-          range.collapse(false);
           selection.removeAllRanges();
           selection.addRange(range);
         }
@@ -402,20 +410,23 @@ async function typePrompt(cdp, inputCdp, prompt, signal) {
   }
   await inputCdp("Input.insertText", { text: prompt });
   await delay(300, signal);
-  const verified = await evaluate(
-    cdp,
-    `(() => {
+  // The composer must hold exactly the prompt we are about to submit: the
+  // harvest later scopes the conversation by this text, so a fused or partial
+  // composer would strand the job with an echo that never matches.
+  const readComposerText = `(() => {
       const selectors = ${selectors};
       for (const selector of selectors) {
         const node = document.querySelector(selector);
         if (!node) continue;
-        const text = node.innerText || node.value || node.textContent || '';
-        if (text.trim().length > 0) return true;
+        return node.innerText || node.value || node.textContent || '';
       }
-      return false;
-    })()`,
-  );
-  if (!verified) {
+      return null;
+    })()`;
+  const normalizeComposerText = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const expectedText = normalizeComposerText(prompt);
+  let composerText = normalizeComposerText(await evaluate(cdp, readComposerText));
+  if (composerText !== expectedText) {
+    // Incremental insertion drifted; overwrite the composer wholesale.
     await evaluate(
       cdp,
       `(() => {
@@ -430,6 +441,14 @@ async function typePrompt(cdp, inputCdp, prompt, signal) {
           editor.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${encodedPrompt}, inputType: 'insertFromPaste' }));
         }
       })()`,
+    );
+    await delay(200, signal);
+    composerText = normalizeComposerText(await evaluate(cdp, readComposerText));
+  }
+  // Fail closed instead of submitting something that cannot be harvested back.
+  if (composerText !== expectedText) {
+    throw new Error(
+      `Composer content does not match the prompt (expected ${expectedText.length} chars, found ${composerText.length})`,
     );
   }
 }

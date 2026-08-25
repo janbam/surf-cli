@@ -1148,6 +1148,9 @@ function mapToolToMessage(tool, args, tabId) {
     case "oracle.result":
       if (!a.id) throw new Error("id required");
       return { ...a, type: "ORACLE_RESULT" };
+    case "oracle.cancel":
+      if (!a.id) throw new Error("id required");
+      return { ...a, type: "ORACLE_CANCEL" };
     case "oracle.list":
       return { type: "ORACLE_LIST" };
     case "chatgpt":

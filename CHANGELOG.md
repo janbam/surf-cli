@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+- **Host-owned oracle harvesting** - The native host now polls a dispatched consult to completion by itself and writes `captured`/`failed` into the job record, instead of only harvesting while a client is calling `oracle.result`. Watchers poll in short queued bursts, so a long generation no longer blocks other browser work, and they are resumed after a host restart. Captures now land within seconds of the answer settling rather than minutes.
+- **`surf oracle cancel <id>`** - Abandon a job, stop its watcher, close its tab, and release the single-job capacity slot. Also exposed to Pi as `surf_oracle_cancel`.
+- **`surf oracle result --timeout <seconds>`** - Choose how long a single wait may block. The host already honoured a per-request wait window; the CLI now exposes it instead of always using the 30s default.
+
+### Fixed
+- **Unrecoverable oracle jobs** - Dispatch now persists the pre-send conversation baseline, so a job's answer is identified by turn identity instead of matching the prompt text in the DOM. A job that cannot be attributed fails immediately with `unattributable` rather than spinning until timeout and returning to `awaiting` forever.
+- **False conversation URLs** - Only ChatGPT's durable server-side conversation id is recorded. The transient `WEB:` placeholder id used to be persisted as the job's recovery key, which pointed later recovery attempts at a different conversation.
+- **Wedged oracle capacity** - Non-terminal jobs idle for over an hour are reaped, and jobs left in `created` by a host restart are retired, so one lost job can no longer block every later consult.
+- **Follow-ups could capture their parent's answer** - A follow-up dispatch snapshotted the conversation as soon as the composer was ready, which is before a reopened conversation paints its turns. The resulting empty baseline disabled turn identity for exactly the case that needs it. Dispatch now waits for the turns to render and refuses to send rather than proceed without a baseline.
+- **Harvest gave up on a warming-up browser** - A watcher resumed after a host restart treated the first extension timeout as fatal and failed a job whose answer ChatGPT had already written. Browser round trips are now retried for five minutes before a job is declared lost, and fresh tabs that never become usable are closed instead of accumulating.
+- **`Edit` prefix in captured answers** - Response cleaning stripped ChatGPT's action row only from the end of a message; layouts that render it above the body leaked an `Edit` line into the stored answer.
+
 ### Changed
 - **ChatGPT Plus support for oracle model/effort selection** - Rewrote `selectModel`/`selectEffort` for the current composer layout: one pill labeled with the active effort (Instant/Medium/High) opening Model/Effort submenu radios. Added `instant`, `medium`, and `high` to the accepted effort vocabulary. The renamed `gpt` package agent now pins GPT-5.6 Sol with High effort for Plus accounts (replacing the Pro-tier `gpt-pro`).
 - **Merge upstream 2.16.x** - Absorbed Surf Oracle external-job hardening (bounded terminal harvests, follow-up dispatch, request-id idempotency, durable follow lineage), dependency refreshes, and releases 2.16.0/2.16.1. The upstream ChatGPT Pro picker fixes (#217–#221) target the Pro-account interface and are intentionally not carried; this fork keeps its Plus-composer selection flow.

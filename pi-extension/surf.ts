@@ -563,6 +563,7 @@ export default function surfExtension(pi: Pi) {
     tool: Type.String(), args: Type.Optional(Type.Record(Type.String(), Type.Unknown())), tabId: Type.Optional(Type.Number()),
   }), (args) => [args.tool as string, (args.args as Record<string, unknown>) ?? {}, args.tabId as number | undefined]);
   registerTool(pi, "surf_oracle_status", "Get the status of a Surf oracle job, or the newest job.", Type.Object({ id: Type.Optional(Type.String()) }), (args) => ["oracle.status", args, undefined]);
+  registerTool(pi, "surf_oracle_cancel", "Abandon a Surf oracle job and release its capacity slot.", Type.Object({ id: Type.String() }), (args) => ["oracle.cancel", args, undefined]);
   pi.registerTool({
     name: "surf_oracle_result",
     label: "surf_oracle_result",

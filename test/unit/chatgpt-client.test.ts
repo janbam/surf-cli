@@ -55,9 +55,16 @@ describe("chatgpt-client", () => {
   describe("cleanChatGPTResponseText", () => {
     it.each([
       [
-        "trims outer blank lines and strips only trailing chrome clusters",
+        "trims outer blank lines and strips chrome at both ends",
         ["", "Copy", "Answer line", "Read aloud", "Share", ""].join("\n"),
-        "Copy\nAnswer line",
+        "Answer line",
+      ],
+      // Observed live: some layouts render the action row above the message,
+      // so captured answers arrived with an "Edit" line glued to the front.
+      [
+        "strips a leading action label from the captured answer",
+        ["Edit", "", "The real answer.", "", "More answer."].join("\n"),
+        "The real answer.\n\nMore answer.",
       ],
       [
         "preserves markdown and code fences",
@@ -70,9 +77,7 @@ describe("chatgpt-client", () => {
           "```",
           "Retry",
         ].join("\r\n"),
-        ["Good response", "Here is code:", "```js", "Copy", "const x = 1;", "```", "Retry"].join(
-          "\n",
-        ),
+        ["Here is code:", "```js", "Copy", "const x = 1;", "```", "Retry"].join("\n"),
       ],
       ["preserves legitimate standalone single-word response: Copy", "Copy", "Copy"],
       ["preserves legitimate standalone single-word response: Edit", "Edit", "Edit"],
@@ -473,10 +478,21 @@ describe("chatgpt-client", () => {
         1,
         false,
       ],
+      // Same message id means the same turn, however much its rendered text
+      // drifts. Treating a re-rendered baseline turn as new content is how a
+      // follow-up job would capture its parent's answer.
       [
-        "text changed",
-        { text: "New answer", messageId: "msg-1" },
-        { text: "Old answer", messageId: "msg-1" },
+        "baseline turn re-rendered under the same message id",
+        { text: "Old answer\nThought for 12s", messageId: "msg-1", turnIndex: 2 },
+        { text: "Old answer", messageId: "msg-1", turnIndex: 1 },
+        3,
+        2,
+        false,
+      ],
+      [
+        "text changed without message ids",
+        { text: "New answer", messageId: null, turnIndex: 0 },
+        { text: "Old answer", messageId: null, turnIndex: 0 },
         2,
         2,
         true,
@@ -515,14 +531,39 @@ describe("chatgpt-client", () => {
       ).toBe(false);
     });
 
-    it("returns false when stop button is still visible", () => {
+    it("returns false while the stop button is visible and the turn has no action row", () => {
       expect(
         chatgptClient.isChatGPTResponseComplete(
-          { text: "Answer", stopVisible: true, hasFinishedActions: true },
+          { text: "Answer", stopVisible: true, hasFinishedActions: false },
           6,
           1200,
         ),
       ).toBe(false);
+    });
+
+    // Observed live: a settled answer kept a page-wide stop button in the DOM
+    // and the job stalled in `awaiting` for 16 minutes. The turn's own action
+    // row is the authority, but only once the text has stopped moving.
+    describe("when the action row and the stop button contradict each other", () => {
+      it("waits while the text is still moving", () => {
+        expect(
+          chatgptClient.isChatGPTResponseComplete(
+            { text: "Answer", stopVisible: true, hasFinishedActions: true },
+            1,
+            400,
+          ),
+        ).toBe(false);
+      });
+
+      it("completes once the text has settled", () => {
+        expect(
+          chatgptClient.isChatGPTResponseComplete(
+            { text: "Answer", stopVisible: true, hasFinishedActions: true },
+            4,
+            1500,
+          ),
+        ).toBe(true);
+      });
     });
 
     it("returns true when finished actions are visible and stop is hidden", () => {
@@ -650,7 +691,10 @@ describe("chatgpt-client", () => {
       );
     });
 
-    it("preserves login check failures instead of downgrading them to login required", async () => {
+    // A login probe that never completed says nothing about the session, so it
+    // must keep its own message and stay uncoded: harvest watchers retry
+    // uncoded failures and treat `auth` as final.
+    it("reports an incomplete login check as transient, not as a login wall", async () => {
       const closeCalls: number[] = [];
 
       await expect(
@@ -672,9 +716,30 @@ describe("chatgpt-client", () => {
             url: "https://chatgpt.com/",
           }),
         }),
-      ).rejects.toThrow("ChatGPT login check failed: TypeError: Failed to fetch");
+      ).rejects.toThrow("ChatGPT login check did not complete: TypeError: Failed to fetch");
 
-      expect(closeCalls).toEqual([123]);
+      await expect(
+        chatgptClient.query({
+          prompt: "hello",
+          getCookies: async () => ({
+            cookies: [{ name: "__Secure-next-auth.session-token.0", value: "abc" }],
+          }),
+          createTab: async () => ({ tabId: 124 }),
+          closeTab: async (tabId: number) => {
+            closeCalls.push(tabId);
+          },
+          cdpCommand: async () => {
+            throw new Error("cdpCommand should not be called");
+          },
+          cdpEvaluate: createReadyChatGptEvaluate({
+            status: 0,
+            error: "TypeError: Failed to fetch",
+            url: "https://chatgpt.com/",
+          }),
+        }),
+      ).rejects.not.toMatchObject({ code: "auth" });
+
+      expect(closeCalls).toEqual([123, 124]);
     });
   });
 
